@@ -51,8 +51,6 @@ class KAN4MMREC(GeneralRecommender):
         self.SplineLinear3 = SplineLinear(self.embedding_size, self.embedding_size)
         self.predictor1 = nn.Linear(self.n_items, self.n_items)
         self.predictor2 = nn.Linear(self.n_items, self.n_items)
-        self.sigmoid_layer1 = nn.Sigmoid()
-        self.sigmoid_layer2 = nn.Sigmoid()
 
     def forward(self):
         # Transform embeddings
@@ -103,10 +101,10 @@ class KAN4MMREC(GeneralRecommender):
         mf_t_loss = self.bpr_loss(u_transformed[users], t_transformed[pos_items], t_transformed[neg_items])
 
         u_i = torch.matmul(u_transformed, i_transformed.transpose(0,1))
-        u_i = self.sigmoid_layer1(self.predictor1(u_i))
+        u_i = self.predictor1(u_i)
         u_t = torch.matmul(u_transformed, t_transformed.transpose(0,1))
-        u_t = self.sigmoid_layer2(self.predictor2(u_t))
-        u_i_mat = torch.mul(u_i, u_t)
+        u_t = self.predictor2(u_t)
+        u_i_mat = (u_i+u_t)/2
 
         u_i_pos = u_i_mat[users, pos_items]
         u_i_neg = u_i_mat[users, neg_items]
@@ -135,13 +133,14 @@ class KAN4MMREC(GeneralRecommender):
         u_transformed, i_transformed, t_transformed = self.forward()
 
         u_i = torch.matmul(u_transformed, i_transformed.transpose(0,1))
-        u_i = self.sigmoid_layer1(self.predictor1(u_i))
+        u_i = self.predictor1(u_i)
         u_t = torch.matmul(u_transformed, t_transformed.transpose(0,1))
-        u_t = self.sigmoid_layer2(self.predictor2(u_t))
+        u_t = self.predictor2(u_t)
 
-        score_mat_ui = torch.mul(u_i, u_t)[users]
+        score_mat_ui = (u_i+u_t)/2
+        score = score_mat_ui[users]
 
-        return score_mat_ui
+        return score
     
 class SplineLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int, init_scale: float = 0.1, **kw) -> None:
