@@ -55,10 +55,10 @@ class KAN4MMREC(GeneralRecommender):
         self.SplineLinear2 = SplineLinear(self.embedding_size, self.embedding_size)
         self.SplineLinear3 = SplineLinear(self.embedding_size, self.embedding_size)
         self.mlp_fusion = nn.Sequential(
-            nn.Linear(self.embedding_size * 2, self.embedding_size),
+            nn.Linear(self.embedding_size * 2, self.embedding_size * 2),
             nn.ReLU(),
             nn.Dropout(self.dropout),
-            nn.Linear(self.embedding_size, self.embedding_size)
+            nn.Linear(self.embedding_size * 2, self.embedding_size)
         )
 
     def forward(self, edge_index_user=None, edge_index_item=None):
@@ -123,7 +123,8 @@ class KAN4MMREC(GeneralRecommender):
         
         # Fuse the scores using an MLP instead of simple averaging
         fusion_input = torch.cat([u_i, u_t], dim=-1)
-        u_i_mat = self.mlp_fusion(fusion_input)
+        fusion_input = fusion_input.view(-1, self.embedding_size * 2)  # Flatten the input for MLP
+        u_i_mat = self.mlp_fusion(fusion_input).view(u_i.shape)  # Reshape back to original dimensions
 
         u_i_pos = u_i_mat[torch.arange(len(users)), pos_items]
         u_i_neg = u_i_mat[torch.arange(len(users)), neg_items]
@@ -156,7 +157,8 @@ class KAN4MMREC(GeneralRecommender):
         
         # Fuse the scores using an MLP instead of simple averaging
         fusion_input = torch.cat([u_i, u_t], dim=-1)
-        score_mat_ui = self.mlp_fusion(fusion_input)
+        fusion_input = fusion_input.view(-1, self.embedding_size * 2)  # Flatten the input for MLP
+        score_mat_ui = self.mlp_fusion(fusion_input).view(u_i.shape)  # Reshape back to original dimensions
         score = score_mat_ui[users]
 
         return score
