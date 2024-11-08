@@ -139,7 +139,7 @@ class KAN4MMREC(GeneralRecommender):
         u_t = torch.matmul(u_transformed, t_transformed.transpose(0,1))
         u_t = self.sigmoid_layer2(self.predictor2(u_t))
 
-        score_mat_ui = torch.mul(u_i, u_t)
+        score_mat_ui = torch.mul(u_i, u_t)[users]
 
         return score_mat_ui
     
