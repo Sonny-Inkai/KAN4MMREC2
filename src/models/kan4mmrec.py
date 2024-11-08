@@ -123,8 +123,7 @@ class KAN4MMREC(GeneralRecommender):
         
         # Fuse the scores using an MLP instead of simple averaging
         fusion_input = torch.cat([u_i, u_t], dim=-1)
-        fusion_input = fusion_input.view(-1, self.embedding_size * 2)  # Flatten the input for MLP
-        u_i_mat = self.mlp_fusion(fusion_input).view(u_i.shape)  # Reshape back to original dimensions
+        u_i_mat = self.mlp_fusion(fusion_input)  # No need to flatten for batch processing
 
         u_i_pos = u_i_mat[torch.arange(len(users)), pos_items]
         u_i_neg = u_i_mat[torch.arange(len(users)), neg_items]
@@ -157,8 +156,7 @@ class KAN4MMREC(GeneralRecommender):
         
         # Fuse the scores using an MLP instead of simple averaging
         fusion_input = torch.cat([u_i, u_t], dim=-1)
-        fusion_input = fusion_input.view(-1, self.embedding_size * 2)  # Flatten the input for MLP
-        score_mat_ui = self.mlp_fusion(fusion_input).view(u_i.shape)  # Reshape back to original dimensions
+        score_mat_ui = self.mlp_fusion(fusion_input)  # No need to flatten for batch processing
         score = score_mat_ui[users]
 
         return score
