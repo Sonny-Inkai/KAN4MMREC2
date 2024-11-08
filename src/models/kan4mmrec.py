@@ -48,15 +48,20 @@ class KAN4MMREC(GeneralRecommender):
         self.kan_text = KANTransformer(self.embedding_size, self.n_layers, dropout=self.dropout)   # For text interactions
 
         # Added GAT for Graph-based interaction modeling
-        self.gat_conv = GATConv(self.embedding_size, self.embedding_size, heads=4, dropout=self.dropout)
+        self.gat_conv_user = GATConv(self.embedding_size, self.embedding_size, heads=4, dropout=self.dropout)
+        self.gat_conv_item = GATConv(self.embedding_size, self.embedding_size, heads=4, dropout=self.dropout)
 
         self.SplineLinear1 = SplineLinear(self.embedding_size, self.embedding_size)
         self.SplineLinear2 = SplineLinear(self.embedding_size, self.embedding_size)
         self.SplineLinear3 = SplineLinear(self.embedding_size, self.embedding_size)
-        self.predictor1 = nn.Linear(self.n_items, self.n_items)
-        self.predictor2 = nn.Linear(self.n_items, self.n_items)
+        self.mlp_fusion = nn.Sequential(
+            nn.Linear(self.embedding_size * 2, self.embedding_size),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.embedding_size, self.embedding_size)
+        )
 
-    def forward(self, edge_index=None):
+    def forward(self, edge_index_user=None, edge_index_item=None):
         # Transform embeddings
         image_embedding_transformed = self.image_trs(self.image_embedding.weight)
         text_embedding_transformed = self.text_trs(self.text_embedding.weight)
@@ -67,9 +72,11 @@ class KAN4MMREC(GeneralRecommender):
         t_transformed = self.kan_text(text_embedding_transformed)  # [num_items, emb_size]
 
         # Apply GAT for graph-based interaction (if edge_index is provided)
-        if edge_index is not None:
-            u_transformed = self.gat_conv(u_transformed, edge_index)
-            i_transformed = self.gat_conv(i_transformed, edge_index)
+        if edge_index_user is not None:
+            u_transformed = self.gat_conv_user(u_transformed, edge_index_user)
+        if edge_index_item is not None:
+            i_transformed = self.gat_conv_item(i_transformed, edge_index_item)
+            t_transformed = self.gat_conv_item(t_transformed, edge_index_item)
 
         u_transformed = self.SplineLinear1(u_transformed)
         i_transformed = self.SplineLinear2(i_transformed)
@@ -97,7 +104,10 @@ class KAN4MMREC(GeneralRecommender):
             Total loss for training.
         """
         # Predict interaction scores for u_i and u_t
-        u_transformed, i_transformed, t_transformed = self.forward(edge_index=interaction[3] if len(interaction) > 3 else None)
+        u_transformed, i_transformed, t_transformed = self.forward(
+            edge_index_user=interaction[3] if len(interaction) > 3 else None,
+            edge_index_item=interaction[4] if len(interaction) > 4 else None
+        )
 
         # Interaction-based loss component
         users = interaction[0]  # Corresponding items that users interacted with (positive items)
@@ -108,11 +118,12 @@ class KAN4MMREC(GeneralRecommender):
         mf_t_loss = self.bpr_loss(u_transformed[users], t_transformed[pos_items], t_transformed[neg_items])
 
         # Predicting scores using interaction matrices
-        u_i = torch.matmul(u_transformed, i_transformed.transpose(0,1))
-        u_i = self.predictor1(u_i)
-        u_t = torch.matmul(u_transformed, t_transformed.transpose(0,1))
-        u_t = self.predictor2(u_t)
-        u_i_mat = (u_i + u_t) / 2
+        u_i = torch.matmul(u_transformed, i_transformed.transpose(0, 1))
+        u_t = torch.matmul(u_transformed, t_transformed.transpose(0, 1))
+        
+        # Fuse the scores using an MLP instead of simple averaging
+        fusion_input = torch.cat([u_i, u_t], dim=-1)
+        u_i_mat = self.mlp_fusion(fusion_input)
 
         u_i_pos = u_i_mat[users, pos_items]
         u_i_neg = u_i_mat[users, neg_items]
@@ -129,7 +140,7 @@ class KAN4MMREC(GeneralRecommender):
 
     def full_sort_predict(self, interaction):
         """
-        Predict scores for all items for a given user by averaging image and text matrices.
+        Predict scores for all items for a given user by fusing image and text matrices.
 
         Args:
             interaction: User interaction data.
@@ -140,12 +151,12 @@ class KAN4MMREC(GeneralRecommender):
         users = interaction[0]
         u_transformed, i_transformed, t_transformed = self.forward()
 
-        u_i = torch.matmul(u_transformed, i_transformed.transpose(0,1))
-        u_i = self.predictor1(u_i)
-        u_t = torch.matmul(u_transformed, t_transformed.transpose(0,1))
-        u_t = self.predictor2(u_t)
-
-        score_mat_ui = (u_i + u_t) / 2
+        u_i = torch.matmul(u_transformed, i_transformed.transpose(0, 1))
+        u_t = torch.matmul(u_transformed, t_transformed.transpose(0, 1))
+        
+        # Fuse the scores using an MLP instead of simple averaging
+        fusion_input = torch.cat([u_i, u_t], dim=-1)
+        score_mat_ui = self.mlp_fusion(fusion_input)
         score = score_mat_ui[users]
 
         return score
