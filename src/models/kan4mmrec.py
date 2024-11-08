@@ -125,8 +125,8 @@ class KAN4MMREC(GeneralRecommender):
         fusion_input = torch.cat([u_i, u_t], dim=-1)
         u_i_mat = self.mlp_fusion(fusion_input)
 
-        u_i_pos = u_i_mat[users, pos_items]
-        u_i_neg = u_i_mat[users, neg_items]
+        u_i_pos = u_i_mat[torch.arange(len(users)), pos_items]
+        u_i_neg = u_i_mat[torch.arange(len(users)), neg_items]
 
         maxi = F.logsigmoid(u_i_pos - u_i_neg)
 
