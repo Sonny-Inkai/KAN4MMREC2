@@ -139,6 +139,7 @@ class Trainer(AbstractTrainer):
                 "Received unrecognized optimizer, set default Adam optimizer"
             )
             optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        print("Optimizer initialized: ", optimizer)
         return optimizer
 
     def _train_epoch(self, train_data, epoch_idx, loss_func=None):
@@ -185,6 +186,7 @@ class Trainer(AbstractTrainer):
                         epoch_idx, batch_idx
                     )
                 )
+                print("Loss is nan at epoch: {}, batch index: {}. Exiting.".format(epoch_idx, batch_idx))
                 return loss, torch.tensor(0.0)
 
             if self.mg and batch_idx % self.beta == 0:
@@ -206,6 +208,7 @@ class Trainer(AbstractTrainer):
                             epoch_idx, batch_idx
                         )
                     )
+                    print("Loss is nan at epoch: {}, batch index: {}. Exiting.".format(epoch_idx, batch_idx))
                     return loss, torch.tensor(0.0)
                 second_loss = -1 * self.alpha2 * loss
                 second_loss.backward()
@@ -216,6 +219,7 @@ class Trainer(AbstractTrainer):
                 clip_grad_norm_(self.model.parameters(), **self.clip_grad_norm)
             self.optimizer.step()
             loss_batches.append(loss.detach())
+            print("Batch {} processed with loss: {:.4f}".format(batch_idx, loss.item()))
             # for test
             # if batch_idx == 0:
             #    break
@@ -237,11 +241,13 @@ class Trainer(AbstractTrainer):
             if self.valid_metric
             else valid_result["NDCG@20"]
         )
+        print("Validation score: {:.4f}".format(valid_score))
         return valid_score, valid_result
 
     def _check_nan(self, loss):
         if torch.isnan(loss):
             # raise ValueError('Training loss is nan')
+            print("Detected NaN in loss")
             return True
 
     def _generate_train_loss_output(self, epoch_idx, s_time, e_time, losses):
@@ -256,6 +262,7 @@ class Trainer(AbstractTrainer):
             )
         else:
             train_loss_output += "train loss: %.4f" % losses
+        print(train_loss_output + "]")
         return train_loss_output + "]"
 
     def fit(
@@ -298,6 +305,9 @@ class Trainer(AbstractTrainer):
                 self.logger.info(train_loss_output)
                 if post_info is not None:
                     self.logger.info(post_info)
+                print(train_loss_output)
+                if post_info is not None:
+                    print(post_info)
 
             # eval: To ensure the test result is the best model under validation data, set self.eval_step == 1
             if (epoch_idx + 1) % self.eval_step == 0:
@@ -324,6 +334,9 @@ class Trainer(AbstractTrainer):
                     self.logger.info(valid_score_output)
                     self.logger.info(valid_result_output)
                     self.logger.info("test result: \n" + dict2str(test_result))
+                    print(valid_score_output)
+                    print(valid_result_output)
+                    print("test result: \n" + dict2str(test_result))
                 if update_flag:
                     update_output = (
                         "██ "
@@ -332,6 +345,7 @@ class Trainer(AbstractTrainer):
                     )
                     if verbose:
                         self.logger.info(update_output)
+                        print(update_output)
                     self.best_valid_result = valid_result
                     self.best_test_upon_valid = test_result
 
@@ -342,6 +356,7 @@ class Trainer(AbstractTrainer):
                     )
                     if verbose:
                         self.logger.info(stop_output)
+                        print(stop_output)
                     break
         return self.best_valid_score, self.best_valid_result, self.best_test_upon_valid
 
@@ -366,6 +381,7 @@ class Trainer(AbstractTrainer):
                 scores, max(self.config["topk"]), dim=-1
             )  # nusers x topk
             batch_matrix_list.append(topk_index)
+        print("Evaluation completed for idx: {}".format(idx))
         return self.evaluator.evaluate(
             batch_matrix_list, eval_data, is_test=is_test, idx=idx
         )
@@ -389,3 +405,4 @@ class Trainer(AbstractTrainer):
             plt.show()
         if save_path:
             plt.savefig(save_path)
+        print("Training loss plot saved at: {}".format(save_path) if save_path else "Training loss plot shown.")

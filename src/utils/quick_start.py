@@ -27,15 +27,28 @@ def quick_start(model, dataset, config_dict, save_model=True, mg=False):
     logger.info("██Dir: \t" + os.getcwd() + "\n")
     logger.info(config)
 
+    # Debug prints
+    print("Server:", platform.node())
+    print("Current Directory:", os.getcwd())
+    print("Config:", config)
+
     # load data
     dataset = RecDataset(config)
     # print dataset statistics
     logger.info(str(dataset))
 
+    # Debug prints
+    print("Dataset Statistics:", str(dataset))
+
     train_dataset, valid_dataset, test_dataset = dataset.split()
     logger.info("\n====Training====\n" + str(train_dataset))
     logger.info("\n====Validation====\n" + str(valid_dataset))
     logger.info("\n====Testing====\n" + str(test_dataset))
+
+    # Debug prints
+    print("\n====Training Dataset====\n", str(train_dataset))
+    print("\n====Validation Dataset====\n", str(valid_dataset))
+    print("\n====Testing Dataset====\n", str(test_dataset))
 
     # wrap into dataloader
     train_data = TrainDataLoader(
@@ -56,6 +69,11 @@ def quick_start(model, dataset, config_dict, save_model=True, mg=False):
         ),
     )
 
+    # Debug prints
+    print("Train DataLoader Initialized.")
+    print("Validation DataLoader Initialized.")
+    print("Test DataLoader Initialized.")
+
     ############ Dataset loadded, run model
     hyper_ret = []
     val_metric = config["valid_metric"].lower()
@@ -63,6 +81,7 @@ def quick_start(model, dataset, config_dict, save_model=True, mg=False):
     idx = best_test_idx = 0
 
     logger.info("\n\n=================================\n\n")
+    print("\n=================================\n")
 
     # hyper-parameters
     hyper_ls = []
@@ -84,12 +103,18 @@ def quick_start(model, dataset, config_dict, save_model=True, mg=False):
                 idx + 1, total_loops, config["hyper_parameters"], hyper_tuple
             )
         )
+        print(
+            "========={}/{}: Parameters:{}={}=======".format(
+                idx + 1, total_loops, config["hyper_parameters"], hyper_tuple
+            )
+        )
 
         # set random state of dataloader
         train_data.pretrain_setup()
         # model loading and initialization
         model = get_model(config["model"])(config, train_data).to(config["device"])
         logger.info(model)
+        print("Model Initialized:", model)
 
         # trainer loading and initialization
         trainer = get_trainer()(config, model, mg)
@@ -119,10 +144,28 @@ def quick_start(model, dataset, config_dict, save_model=True, mg=False):
             )
         )
 
+        # Debug prints
+        print("Best Validation Result:", dict2str(best_valid_result))
+        print("Test Result:", dict2str(best_test_upon_valid))
+        print(
+            "Current Best:\nParameters: {}={},\nValid: {},\nTest: {}\n".format(
+                config["hyper_parameters"],
+                hyper_ret[best_test_idx][0],
+                dict2str(hyper_ret[best_test_idx][1]),
+                dict2str(hyper_ret[best_test_idx][2]),
+            )
+        )
+
     # log info
     logger.info("\n============All Over=====================")
+    print("\n============All Over=====================")
     for p, k, v in hyper_ret:
         logger.info(
+            "Parameters: {}={},\n best valid: {},\n best test: {}".format(
+                config["hyper_parameters"], p, dict2str(k), dict2str(v)
+            )
+        )
+        print(
             "Parameters: {}={},\n best valid: {},\n best test: {}".format(
                 config["hyper_parameters"], p, dict2str(k), dict2str(v)
             )
@@ -131,6 +174,15 @@ def quick_start(model, dataset, config_dict, save_model=True, mg=False):
     logger.info("\n\n█████████████ BEST ████████████████")
     logger.info(
         "\tParameters: {}={},\nValid: {},\nTest: {}\n\n".format(
+            config["hyper_parameters"],
+            hyper_ret[best_test_idx][0],
+            dict2str(hyper_ret[best_test_idx][1]),
+            dict2str(hyper_ret[best_test_idx][2]),
+        )
+    )
+    print("\n\n█████████████ BEST ████████████████")
+    print(
+        "\tParameters: {}={},\nValid: {},\nTest: {}\n".format(
             config["hyper_parameters"],
             hyper_ret[best_test_idx][0],
             dict2str(hyper_ret[best_test_idx][1]),
@@ -156,9 +208,10 @@ def quick_eval(
     str(train_dataset)
     str(valid_dataset)
     str(test_dataset)
-    # print('\n====Training====\n' + str(train_dataset))
-    # print('\n====Validation====\n' + str(valid_dataset))
-    # print('\n====Testing====\n' + str(test_dataset))
+    # Debug prints
+    print("\n====Training Dataset====\n", str(train_dataset))
+    print("\n====Validation Dataset====\n", str(valid_dataset))
+    print("\n====Testing Dataset====\n", str(test_dataset))
 
     # wrap into dataloader
     train_data = TrainDataLoader(
@@ -179,6 +232,11 @@ def quick_eval(
         ),
     )
 
+    # Debug prints
+    print("Train DataLoader Initialized.")
+    print("Validation DataLoader Initialized.")
+    print("Test DataLoader Initialized.")
+
     # hyper-parameters
     hyper_ls = []
     if "seed" not in config["hyper_parameters"]:
@@ -198,6 +256,7 @@ def quick_eval(
         train_data.pretrain_setup()
         # model loading and initialization
         model = get_model(config["model"])(config, train_data).to(config["device"])
+        print("Model Initialized:", model)
 
         # trainer loading and initialization
         trainer = get_trainer()(config, model)
