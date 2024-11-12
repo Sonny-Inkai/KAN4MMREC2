@@ -6,9 +6,9 @@ from torch_geometric.utils import add_self_loops, remove_self_loops, degree
 from common.abstract_recommender import GeneralRecommender
 from common.loss import BPRLoss, EmbLoss
 
-class InteractiveMultimodalContrastiveGraphNetwork(GeneralRecommender):
+class KAN4MMREC(GeneralRecommender):
     def __init__(self, config, dataset):
-        super(InteractiveMultimodalContrastiveGraphNetwork, self).__init__(config, dataset)
+        super(KAN4MMREC, self).__init__(config, dataset)
 
         # Config parameters
         self.embedding_dim = config["embedding_size"]
