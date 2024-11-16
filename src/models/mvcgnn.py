@@ -24,9 +24,11 @@ class MVCGNN(GeneralRecommender):
         self.feat_embed_dim = config["feat_embed_dim"]
         self.n_layers = config["n_layers"]  # Number of GNN layers
         self.reg_weight = config["reg_weight"]
-        self.ssl_temp = config.get("ssl_temp", 0.1)
-        self.ssl_reg = config.get("ssl_reg", 0.1)
-        self.k = config.get("knn_k", 10)
+
+        # Retrieve optional parameters with default values
+        self.ssl_temp = config["ssl_temp"] if "ssl_temp" in config else 0.1
+        self.ssl_reg = config["ssl_reg"] if "ssl_reg" in config else 0.1
+        self.k = config["knn_k"] if "knn_k" in config else 10
 
         # Initialize embeddings
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
@@ -246,6 +248,7 @@ class LightGCNConv(MessagePassing):
         row, col = edge_index
         deg = degree(row, x.size(0), dtype=x.dtype)
         deg_inv_sqrt = deg.pow(-0.5)
+        deg_inv_sqrt[deg_inv_sqrt == float('inf')] = 0
         norm = deg_inv_sqrt[row] * deg_inv_sqrt[col]
         return self.propagate(edge_index, x=x, norm=norm)
 
