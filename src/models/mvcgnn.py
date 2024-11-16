@@ -24,10 +24,9 @@ class MVCGNN(GeneralRecommender):
         self.feat_embed_dim = config["feat_embed_dim"]
         self.n_layers = config["n_layers"]  # Number of GNN layers
         self.reg_weight = config["reg_weight"]
-        self.ssl_temp = config["ssl_temp"]
-        self.ssl_reg = config["ssl_reg"]
-        self.k = config["knn_k"]
-        self.device = config["device"]
+        self.ssl_temp = config.get("ssl_temp", 0.1)
+        self.ssl_reg = config.get("ssl_reg", 0.1)
+        self.k = config.get("knn_k", 10)
 
         # Initialize embeddings
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
@@ -77,21 +76,21 @@ class MVCGNN(GeneralRecommender):
         # Build graphs
         self.inter_edge_index = self.build_interaction_graph(dataset)
         self.visual_edge_index = self.build_modality_graph(
-            self.image_trs(self.image_embedding.weight), self.k
+            self.image_trs(self.image_embedding.weight.detach()), self.k
         )
         self.textual_edge_index = self.build_modality_graph(
-            self.text_trs(self.text_embedding.weight), self.k
+            self.text_trs(self.text_embedding.weight.detach()), self.k
         )
 
     def build_interaction_graph(self, dataset):
         # Build user-item interaction graph
         interactions = dataset.inter_matrix(form="coo").astype(np.int64)
-        rows = torch.tensor(interactions.row, dtype=torch.long)
-        cols = torch.tensor(interactions.col + self.n_users, dtype=torch.long)
+        rows = torch.from_numpy(interactions.row).long()
+        cols = torch.from_numpy(interactions.col + self.n_users).long()
         edge_index = torch.stack(
             [torch.cat([rows, cols]), torch.cat([cols, rows])], dim=0
         )
-        return edge_index.to(self.device)
+        return edge_index
 
     def build_modality_graph(self, features, k):
         # Build k-NN graph based on feature similarities
@@ -105,7 +104,7 @@ class MVCGNN(GeneralRecommender):
             for neighbor in neighbors:
                 edge_index.append([i, neighbor.item()])
         edge_index = torch.tensor(edge_index).t()
-        return edge_index.to(self.device)
+        return edge_index
 
     def forward(self):
         # Get embeddings
@@ -212,7 +211,7 @@ class MVCGNN(GeneralRecommender):
         emb1 = emb1 / emb1.norm(dim=1, keepdim=True)
         emb2 = emb2 / emb2.norm(dim=1, keepdim=True)
         logits = torch.mm(emb1, emb2.t()) / self.ssl_temp
-        labels = torch.arange(batch_size).to(self.device)
+        labels = torch.arange(batch_size)
         loss = self.ssl_criterion(logits, labels)
         return loss
 
