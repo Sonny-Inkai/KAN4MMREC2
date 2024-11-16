@@ -30,8 +30,8 @@ class CROWN(GeneralRecommender):
         self.reward_gamma = config["reward_gamma"]
         self.contextual_factor = config["contextual_factor"]
 
-        self.n_users = self.n_users
-        self.n_items = self.n_items
+        self.n_users = self.dataset.n_users
+        self.n_items = self.dataset.n_items
         self.n_nodes = self.n_users + self.n_items
 
         # Load interaction matrix
