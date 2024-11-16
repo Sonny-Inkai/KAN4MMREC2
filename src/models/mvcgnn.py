@@ -77,10 +77,10 @@ class MVCGNN(GeneralRecommender):
         # Build graphs
         self.inter_edge_index = self.build_interaction_graph(dataset)
         self.visual_edge_index = self.build_modality_graph(
-            self.image_trs(self.image_embedding.weight.detach()).cpu(), self.k
+            self.image_trs(self.image_embedding.weight), self.k
         )
         self.textual_edge_index = self.build_modality_graph(
-            self.text_trs(self.text_embedding.weight.detach()).cpu(), self.k
+            self.text_trs(self.text_embedding.weight), self.k
         )
 
     def build_interaction_graph(self, dataset):
