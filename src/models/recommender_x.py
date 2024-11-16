@@ -24,8 +24,8 @@ class RECOMMENDER_X(GeneralRecommender):
         self.embedding_dim = config["embedding_size"]
         self.feat_embed_dim = config["feat_embed_dim"]
         self.n_layers = config["n_layers"]  # Number of GNN layers
-        self.time_decay = config.get("time_decay", 0.8)
-        self.context_features = config.get("context_features", [])
+        self.time_decay = config["time_decay"]
+        self.context_features = config["context_features"]
         self.device = config["device"]
 
         # Initialize embeddings
