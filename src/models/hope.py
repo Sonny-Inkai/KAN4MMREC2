@@ -35,7 +35,7 @@ class HOPE(GeneralRecommender):
         self.gnn_text = GATConv(self.feat_embed_dim, self.embedding_dim, heads=4, concat=True, dropout=self.dropout)
 
         # Cross-modal contrastive fusion layers
-        self.cross_modal_fc = nn.Linear(4 * self.embedding_dim, self.embedding_dim)
+        self.cross_modal_fc = nn.Linear(8 * self.embedding_dim, self.embedding_dim)
 
         # Counterfactual reasoning for bias mitigation
         self.counterfactual_weight = nn.Parameter(torch.FloatTensor([0.5]))
