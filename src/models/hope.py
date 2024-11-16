@@ -139,5 +139,5 @@ class HOPE(GeneralRecommender):
         fused_features = self.cross_modal_fusion(image_features, text_features)
         final_representation = self.counterfactual_reasoning(fused_features)
 
-        scores = torch.matmul(user_emb, final_representation.tranpose(0,1))
+        scores = torch.matmul(user_emb, final_representation.transpose(0,1))
         return scores
