@@ -1,6 +1,5 @@
 # mvcgnn.py
 # coding: utf-8
-# @email: your_email@example.com
 
 """
 MVCGNN: Multi-View Contrastive Graph Neural Networks for Multimodal Recommendation
@@ -75,14 +74,15 @@ class MVCGNN(GeneralRecommender):
         # Contrastive loss
         self.ssl_criterion = nn.CrossEntropyLoss()
 
-        # Build graphs
+        # Build interaction graph
         self.inter_edge_index = self.build_interaction_graph(dataset)
-        self.visual_edge_index = self.build_modality_graph(
-            self.image_trs(self.image_embedding.weight), self.k
-        )
-        self.textual_edge_index = self.build_modality_graph(
-            self.text_trs(self.text_embedding.weight), self.k
-        )
+
+        # Placeholders for modality graphs
+        self.visual_edge_index = None
+        self.textual_edge_index = None
+
+        # Flag to check if modality graphs are built
+        self.modality_graphs_built = False
 
     def build_interaction_graph(self, dataset):
         # Build user-item interaction graph
@@ -93,6 +93,17 @@ class MVCGNN(GeneralRecommender):
             [torch.cat([rows, cols]), torch.cat([cols, rows])], dim=0
         )
         return edge_index
+
+    def build_modality_graphs(self):
+        # Build modality graphs after model is moved to device
+        with torch.no_grad():
+            image_feat = self.image_trs(self.image_embedding.weight)
+            self.visual_edge_index = self.build_modality_graph(image_feat, self.k)
+
+            text_feat = self.text_trs(self.text_embedding.weight)
+            self.textual_edge_index = self.build_modality_graph(text_feat, self.k)
+
+        self.modality_graphs_built = True
 
     def build_modality_graph(self, features, k):
         # Build k-NN graph based on feature similarities
@@ -109,6 +120,10 @@ class MVCGNN(GeneralRecommender):
         return edge_index
 
     def forward(self):
+        # Ensure modality graphs are built
+        if not self.modality_graphs_built:
+            self.build_modality_graphs()
+
         # Get embeddings
         user_emb = self.user_embedding.weight
         item_emb = self.item_embedding.weight
