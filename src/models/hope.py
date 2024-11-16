@@ -30,9 +30,9 @@ class HOPE(GeneralRecommender):
             self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
             self.text_transform = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
 
-        # GNN layers for Graph Attention Networks
-        self.gnn_image = GATConv(self.feat_embed_dim, self.embedding_dim, heads=2, concat=True)
-        self.gnn_text = GATConv(self.feat_embed_dim, self.embedding_dim, heads=2, concat=True)
+        # Enhanced GNN layers for Graph Attention Networks
+        self.gnn_image = GATConv(self.feat_embed_dim, self.embedding_dim, heads=4, concat=True, dropout=self.dropout)
+        self.gnn_text = GATConv(self.feat_embed_dim, self.embedding_dim, heads=4, concat=True, dropout=self.dropout)
 
         # Cross-modal contrastive fusion layers
         self.cross_modal_fc = nn.Linear(4 * self.embedding_dim, self.embedding_dim)
@@ -115,8 +115,8 @@ class HOPE(GeneralRecommender):
         fused_features = self.cross_modal_fusion(image_features, text_features)
         final_representation = self.counterfactual_reasoning(fused_features)
 
-        pos_item_emb = final_representation[pos_items]
-        neg_item_emb = final_representation[neg_items]
+        pos_item_emb = self.item_embedding(pos_items)
+        neg_item_emb = self.item_embedding(neg_items)
 
         bpr_loss = self.bpr_loss(user_emb, pos_item_emb, neg_item_emb)
         reg_loss = self.reg_weight * (user_emb.norm(2).pow(2) + pos_item_emb.norm(2).pow(2) + neg_item_emb.norm(2).pow(2))
@@ -133,11 +133,11 @@ class HOPE(GeneralRecommender):
 
     def full_sort_predict(self, interaction):
         users = interaction[0]
-        user_emb = self.user_embedding.weight[users]
+        user_emb = self.user_embedding(users)
         image_features = self.forward(modality='image')
         text_features = self.forward(modality='text')
         fused_features = self.cross_modal_fusion(image_features, text_features)
         final_representation = self.counterfactual_reasoning(fused_features)
 
-        scores = torch.matmul(user_emb, final_representation.transpose(0,1))
+        scores = torch.matmul(user_emb, self.item_embedding.weight.transpose(0, 1))
         return scores
