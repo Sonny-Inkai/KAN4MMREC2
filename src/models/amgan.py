@@ -108,10 +108,10 @@ class AMGAN(GeneralRecommender):
 
         if self.v_feat is not None:
             visual_features = F.relu(self.image_trs(self.image_embedding.weight))
-            multimodal_rep += visual_features[:multimodal_rep.size(0), :]  # Adjust dimensions to match
+            multimodal_rep[:visual_features.size(0), :] += visual_features  # Adjust dimensions to match
         if self.t_feat is not None:
             textual_features = F.relu(self.text_trs(self.text_embedding.weight))
-            multimodal_rep += textual_features[:multimodal_rep.size(0), :]  # Adjust dimensions to match
+            multimodal_rep[:textual_features.size(0), :] += textual_features  # Adjust dimensions to match
 
         temporal_output = self.temporal_attention(multimodal_rep.unsqueeze(0))
         return temporal_output.squeeze(0)
