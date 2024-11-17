@@ -1,7 +1,7 @@
 # coding: utf-8
 # @email: enoche.chow@gmail.com
 r"""
-CMFFN: Contrastive Multi-Level Feature Fusion Network for Robust Multimedia Recommendation
+HCM-Rec: Hierarchical Cross-Modal Transformer for Multimedia Recommendations
 # Update: 17/11/2024
 """
 
@@ -13,26 +13,28 @@ from torch.nn import Parameter
 from common.abstract_recommender import GeneralRecommender
 from common.loss import BPRLoss, EmbLoss
 
-class MultiLevelFeatureFusion(nn.Module):
-    def __init__(self, embedding_dim):
-        super(MultiLevelFeatureFusion, self).__init__()
-        self.embedding_dim = embedding_dim
-        self.weight_text = Parameter(torch.Tensor(1))
-        self.weight_image = Parameter(torch.Tensor(1))
-        self.weight_collaborative = Parameter(torch.Tensor(1))
-        nn.init.constant_(self.weight_text, 1.0)
-        nn.init.constant_(self.weight_image, 1.0)
-        nn.init.constant_(self.weight_collaborative, 1.0)
+class CrossModalTransformer(nn.Module):
+    def __init__(self, embedding_dim, num_heads, num_layers):
+        super(CrossModalTransformer, self).__init__()
+        encoder_layer = nn.TransformerEncoderLayer(d_model=embedding_dim, nhead=num_heads)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
     def forward(self, text_feat, image_feat, collaborative_feat):
-        # Weighted average fusion of different modalities
-        combined_feat = (
-            self.weight_text * text_feat +
-            self.weight_image * image_feat +
-            self.weight_collaborative * collaborative_feat
-        ) / (self.weight_text + self.weight_image + self.weight_collaborative)
-        return combined_feat
+        # Stack features along the sequence dimension for transformer input
+        combined_feat = torch.stack((text_feat, image_feat, collaborative_feat), dim=0)
+        # Pass through transformer encoder
+        output = self.transformer_encoder(combined_feat)
+        # Aggregate the output
+        return torch.mean(output, dim=0)
 
+class HierarchicalAttention(nn.Module):
+    def __init__(self, embedding_dim):
+        super(HierarchicalAttention, self).__init__()
+        self.attention_layer = nn.MultiheadAttention(embed_dim=embedding_dim, num_heads=4)
+
+    def forward(self, query, key, value):
+        attn_output, _ = self.attention_layer(query, key, value)
+        return attn_output
 
 class AMGAN(GeneralRecommender):
     def __init__(self, config, dataset):
@@ -59,8 +61,11 @@ class AMGAN(GeneralRecommender):
             self.text_trs = nn.Linear(self.t_feat.shape[1], self.embedding_dim)
             nn.init.xavier_uniform_(self.text_trs.weight)
 
-        # Feature Fusion Module
-        self.fusion = MultiLevelFeatureFusion(self.embedding_dim)
+        # Cross-Modal Transformer Module
+        self.cross_modal_transformer = CrossModalTransformer(self.embedding_dim, num_heads=4, num_layers=2)
+
+        # Hierarchical Attention Module
+        self.hierarchical_attention = HierarchicalAttention(self.embedding_dim)
 
     def forward(self, user_indices, item_indices):
         user_embed = self.user_embedding(user_indices)
@@ -77,8 +82,12 @@ class AMGAN(GeneralRecommender):
         else:
             text_feat = torch.zeros_like(item_embed)
 
-        # Fusion of multimodal features
-        combined_item_feat = self.fusion(text_feat, image_feat, item_embed)
+        # Cross-Modal Transformer Fusion
+        combined_item_feat = self.cross_modal_transformer(text_feat, image_feat, item_embed)
+
+        # Hierarchical Attention
+        combined_item_feat = self.hierarchical_attention(combined_item_feat.unsqueeze(0), combined_item_feat.unsqueeze(0), combined_item_feat.unsqueeze(0)).squeeze(0)
+
         return user_embed, combined_item_feat
 
     def calculate_loss(self, interaction):
@@ -119,8 +128,11 @@ class AMGAN(GeneralRecommender):
         else:
             text_feat = torch.zeros_like(item_embed)
 
-        # Fusion of multimodal features for all items
-        combined_item_feat = self.fusion(text_feat, image_feat, item_embed)
+        # Cross-Modal Transformer Fusion for all items
+        combined_item_feat = self.cross_modal_transformer(text_feat, image_feat, item_embed)
+
+        # Hierarchical Attention for all items
+        combined_item_feat = self.hierarchical_attention(combined_item_feat.unsqueeze(0), combined_item_feat.unsqueeze(0), combined_item_feat.unsqueeze(0)).squeeze(0)
 
         # Dot product between user and all items
         scores = torch.matmul(user_embed, combined_item_feat.t())
