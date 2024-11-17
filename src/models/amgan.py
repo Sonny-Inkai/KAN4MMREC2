@@ -17,6 +17,7 @@ from common.abstract_recommender import GeneralRecommender
 from common.loss import BPRLoss, EmbLoss
 from common.init import xavier_uniform_initialization
 
+
 class DynamicGraphUpdate(nn.Module):
     def __init__(self, n_users, n_items, embedding_dim):
         super(DynamicGraphUpdate, self).__init__()
@@ -105,8 +106,9 @@ class AMGAN(GeneralRecommender):
         user_output, item_output = self.dynamic_graph(user_sequence, item_sequence)
         x = torch.cat((user_output, item_output), dim=0)
         edge_index = torch.cat((self.edge_index, self.edge_index[[1, 0]]), dim=1)
-        multimodal_rep = self.graph_attention(x, edge_index)
 
+        # Project visual and textual embeddings
+        multimodal_rep = self.graph_attention(x, edge_index)
         if self.v_feat is not None:
             visual_features = F.relu(self.image_trs(self.image_embedding.weight))
             multimodal_rep += visual_features
