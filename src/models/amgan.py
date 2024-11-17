@@ -1,138 +1,162 @@
 # coding: utf-8
-# @title Adaptive Multimodal Graph Attention Network (AMGAN)
-# "Adaptive Multimodal Graph Attention for Dynamic Representation Learning in Multimedia Recommendation Systems"
+# @email: enoche.chow@gmail.com
+r"""
+AMGAN: Adaptive Multimodal Graph Attention for Dynamic Representation Learning in Multimedia Recommendation Systems
+"""
 import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import MessagePassing
-from torch_geometric.utils import add_self_loops, degree
 import numpy as np
-from torch.nn import Parameter
-from torch_scatter import scatter_add
+import scipy.sparse as sp
+from torch_geometric.nn import MessagePassing
+from torch_geometric.utils import add_self_loops, remove_self_loops, dropout_adj
+
 from common.abstract_recommender import GeneralRecommender
-from common.loss import BPRLoss, EmbLoss
+from common.loss import EmbLoss
+
+
+class DynamicGraphUpdateModule(nn.Module):
+    def __init__(self, input_dim, hidden_dim):
+        super(DynamicGraphUpdateModule, self).__init__()
+        self.rnn = nn.GRU(input_dim, hidden_dim, batch_first=True)
+
+    def forward(self, edge_features, hidden_state=None):
+        # Use an RNN to model changes in edge weights over time
+        output, hidden_state = self.rnn(edge_features, hidden_state)
+        return output, hidden_state
+
+
+class MultimodalGraphAttentionLayer(MessagePassing):
+    def __init__(self, in_channels, out_channels):
+        super(MultimodalGraphAttentionLayer, self).__init__(aggr="add")  # Aggregate messages using sum
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.fc = nn.Linear(in_channels, out_channels)
+        self.attention = nn.Linear(2 * out_channels, 1)
+
+    def forward(self, x, edge_index):
+        # Add self-loops to the adjacency matrix
+        edge_index, _ = add_self_loops(edge_index, num_nodes=x.size(0))
+        # Transform node features
+        x = self.fc(x)
+        return self.propagate(edge_index, x=x)
+
+    def message(self, x_i, x_j, edge_index, size):
+        # Compute attention coefficients
+        attention_input = torch.cat([x_i, x_j], dim=-1)
+        alpha = F.leaky_relu(self.attention(attention_input))
+        alpha = torch.sigmoid(alpha)
+        return x_j * alpha
+
+
+class TemporalSelfAttentionEncoder(nn.Module):
+    def __init__(self, embed_dim, num_heads):
+        super(TemporalSelfAttentionEncoder, self).__init__()
+        self.self_attention = nn.MultiheadAttention(embed_dim, num_heads)
+
+    def forward(self, x):
+        # Self-attention expects input of shape (sequence_length, batch_size, embed_dim)
+        x = x.permute(1, 0, 2)
+        output, _ = self.self_attention(x, x, x)
+        return output.permute(1, 0, 2)
+
 
 class AMGAN(GeneralRecommender):
     def __init__(self, config, dataset):
         super(AMGAN, self).__init__(config, dataset)
-
-        self.embedding_dim = config['embedding_size']
-        self.feat_embed_dim = config['feat_embed_dim']
+        
         self.num_user = self.n_users
         self.num_item = self.n_items
-        self.n_layers = config['n_layers']
-        self.dropout = config['dropout']
-        self.device = config['device']
+        self.embedding_dim = config['embedding_size']
+        self.hidden_dim = config['hidden_size']
+        self.num_heads = config['num_heads']
+        self.reg_weight = config['reg_weight']
 
-        # Define user and item embeddings
+        # Embeddings
         self.user_embedding = nn.Embedding(self.num_user, self.embedding_dim)
         self.item_embedding = nn.Embedding(self.num_item, self.embedding_dim)
         nn.init.xavier_uniform_(self.user_embedding.weight)
         nn.init.xavier_uniform_(self.item_embedding.weight)
 
-        # Define multimodal feature embeddings
+        # Multimodal Feature Transformation
         if self.v_feat is not None:
-            self.visual_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
-            self.visual_trs = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
+            self.image_transform = nn.Linear(self.v_feat.shape[1], self.embedding_dim)
         if self.t_feat is not None:
-            self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
-            self.text_trs = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
-        
-        # Multimodal graph attention layers
-        self.graph_attention_layer = GraphAttentionLayer(self.embedding_dim)
-        self.dynamic_graph_update = DynamicGraphUpdate(self.embedding_dim)
-        
-        # Temporal self-attention encoder
-        self.temporal_self_attention = nn.MultiheadAttention(embed_dim=self.embedding_dim, num_heads=4)
+            self.text_transform = nn.Linear(self.t_feat.shape[1], self.embedding_dim)
 
-    def forward(self, edge_index):
-        # Initial embeddings
-        user_emb = self.user_embedding.weight
-        item_emb = self.item_embedding.weight
-        
-        # Concatenate user and item embeddings
-        x = torch.cat([user_emb, item_emb], dim=0)
+        # Dynamic Graph Update Module
+        self.dynamic_graph_update = DynamicGraphUpdateModule(self.embedding_dim, self.hidden_dim)
 
-        # Update graph structure using recent interactions
-        dynamic_edge_index = self.dynamic_graph_update(edge_index, x)
+        # Multimodal Graph Attention Layer
+        self.graph_attention = MultimodalGraphAttentionLayer(self.embedding_dim, self.embedding_dim)
 
-        # Apply multimodal graph attention
-        x = self.graph_attention_layer(x, dynamic_edge_index)
-        
-        # Apply temporal self-attention
-        x = x.unsqueeze(0)  # Add sequence dimension for attention
-        x, _ = self.temporal_self_attention(x, x, x)
-        x = x.squeeze(0)
+        # Temporal Self-Attention Encoder
+        self.temporal_attention = TemporalSelfAttentionEncoder(self.embedding_dim, self.num_heads)
 
-        # Split user and item embeddings after transformation
-        user_rep, item_rep = torch.split(x, [self.num_user, self.num_item], dim=0)
-        
-        return user_rep, item_rep
+        # Loss function
+        self.reg_loss = EmbLoss()
+
+    def forward(self, edge_index, edge_features, hidden_state=None):
+        # Dynamic graph update
+        edge_features, hidden_state = self.dynamic_graph_update(edge_features, hidden_state)
+
+        # Get node embeddings
+        user_embedding = self.user_embedding.weight
+        item_embedding = self.item_embedding.weight
+        all_embeddings = torch.cat([user_embedding, item_embedding], dim=0)
+
+        # Multimodal feature transformation
+        if self.v_feat is not None:
+            image_features = F.leaky_relu(self.image_transform(self.v_feat))
+            all_embeddings = torch.cat([all_embeddings, image_features], dim=1)
+        if self.t_feat is not None:
+            text_features = F.leaky_relu(self.text_transform(self.t_feat))
+            all_embeddings = torch.cat([all_embeddings, text_features], dim=1)
+
+        # Graph attention
+        node_embeddings = self.graph_attention(all_embeddings, edge_index)
+
+        # Temporal attention
+        node_embeddings = self.temporal_attention(node_embeddings)
+
+        return node_embeddings
 
     def calculate_loss(self, interaction):
         users = interaction[0]
-        pos_items = interaction[1]
-        neg_items = interaction[2]
+        pos_items = interaction[1] + self.num_user
+        neg_items = interaction[2] + self.num_user
 
-        user_rep, item_rep = self.forward(self.edge_index)
+        # Get the representations
+        edge_index, _ = dropout_adj(self.edge_index, p=self.dropout)
+        edge_features = torch.ones(edge_index.size(1), self.embedding_dim).to(self.device)  # Dummy edge features
+        all_embeddings = self.forward(edge_index, edge_features)
 
-        u_g_embeddings = user_rep[users]
-        pos_i_g_embeddings = item_rep[pos_items]
-        neg_i_g_embeddings = item_rep[neg_items]
+        user_tensor = all_embeddings[users]
+        pos_item_tensor = all_embeddings[pos_items]
+        neg_item_tensor = all_embeddings[neg_items]
 
-        pos_scores = torch.sum(u_g_embeddings * pos_i_g_embeddings, dim=1)
-        neg_scores = torch.sum(u_g_embeddings * neg_i_g_embeddings, dim=1)
+        # BPR loss
+        pos_scores = torch.sum(user_tensor * pos_item_tensor, dim=-1)
+        neg_scores = torch.sum(user_tensor * neg_item_tensor, dim=-1)
+        bpr_loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
 
-        loss = -torch.mean(torch.log(torch.sigmoid(pos_scores - neg_scores)))
-        return loss
+        # Regularization loss
+        reg_loss = self.reg_weight * self.reg_loss(user_tensor, pos_item_tensor)
+
+        return bpr_loss + reg_loss
 
     def full_sort_predict(self, interaction):
-        users = interaction[0]
-        user_rep, item_rep = self.forward(self.edge_index)
+        user = interaction[0]
 
-        u_embeddings = user_rep[users]
-        scores = torch.matmul(u_embeddings, item_rep.t())
+        # Get the representations
+        edge_index, _ = dropout_adj(self.edge_index, p=self.dropout)
+        edge_features = torch.ones(edge_index.size(1), self.embedding_dim).to(self.device)  # Dummy edge features
+        all_embeddings = self.forward(edge_index, edge_features)
+
+        user_embedding = all_embeddings[user]
+        item_embeddings = all_embeddings[self.num_user:]
+
+        # Compute scores
+        scores = torch.matmul(user_embedding, item_embeddings.t())
         return scores
-
-
-class GraphAttentionLayer(MessagePassing):
-    def __init__(self, in_channels, aggr='add'):
-        super(GraphAttentionLayer, self).__init__(aggr=aggr)
-        self.in_channels = in_channels
-        self.attn_linear = nn.Linear(2 * in_channels, 1)
-        nn.init.xavier_uniform_(self.attn_linear.weight)
-
-    def forward(self, x, edge_index):
-        edge_index, _ = add_self_loops(edge_index, num_nodes=x.size(0))
-        return self.propagate(edge_index, x=x)
-
-    def message(self, x_i, x_j, edge_index):
-        # Concatenate and compute attention scores
-        alpha = torch.cat([x_i, x_j], dim=1)
-        alpha = F.leaky_relu(self.attn_linear(alpha))
-        alpha = torch.exp(alpha)
-        alpha_sum = scatter_add(alpha, edge_index[0], dim=0)
-        alpha = alpha / (alpha_sum[edge_index[0]] + 1e-7)
-        return x_j * alpha
-
-
-class DynamicGraphUpdate(nn.Module):
-    def __init__(self, embedding_dim):
-        super(DynamicGraphUpdate, self).__init__()
-        self.rnn = nn.GRU(input_size=embedding_dim, hidden_size=embedding_dim, batch_first=True)
-
-    def forward(self, edge_index, x):
-        # Convert edge index to a dense adjacency matrix
-        adj_matrix = torch.zeros((x.size(0), x.size(0))).to(x.device)
-        adj_matrix[edge_index[0], edge_index[1]] = 1
-        
-        # Feed adjacency matrix through RNN to update structure
-        adj_matrix = adj_matrix.unsqueeze(0)  # Add batch dimension
-        _, updated_adj_matrix = self.rnn(adj_matrix)
-        updated_adj_matrix = updated_adj_matrix.squeeze(0)
-
-        # Thresholding to make the matrix binary
-        updated_adj_matrix = (updated_adj_matrix > 0.5).float()
-        updated_edge_index = torch.nonzero(updated_adj_matrix, as_tuple=False).t()
-        return updated_edge_index
