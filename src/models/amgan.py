@@ -15,9 +15,9 @@ from common.abstract_recommender import GeneralRecommender
 from common.loss import BPRLoss, EmbLoss, L2Loss
 from sklearn.cluster import KMeans
 
-class HybridRecModel(GeneralRecommender):
+class AMGAN(GeneralRecommender):
     def __init__(self, config, dataset):
-        super(HybridRecModel, self).__init__(config, dataset)
+        super(AMGAN, self).__init__(config, dataset)
         
         # Configuration and hyperparameters
         self.embedding_dim = config["embedding_size"]
