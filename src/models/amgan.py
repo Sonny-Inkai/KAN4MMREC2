@@ -14,7 +14,6 @@ from torch_geometric.utils import remove_self_loops, add_self_loops, degree
 from common.abstract_recommender import GeneralRecommender
 from common.loss import BPRLoss, EmbLoss, L2Loss
 from sklearn.cluster import KMeans
-from torch_scatter import scatter
 
 class HybridRecModel(GeneralRecommender):
     def __init__(self, config, dataset):
