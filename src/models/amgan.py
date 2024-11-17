@@ -1,69 +1,37 @@
 # coding: utf-8
 # @email: enoche.chow@gmail.com
 r"""
-AMGAN: Adaptive Multimodal Graph Attention Network for Dynamic Representation Learning in Multimedia Recommendation Systems
-# Update: 01/11/2024
+CMFFN: Contrastive Multi-Level Feature Fusion Network for Robust Multimedia Recommendation
+# Update: 17/11/2024
 """
 
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from torch.nn import Parameter
-from torch_geometric.nn.conv import MessagePassing
-from torch_geometric.utils import dropout_adj
 from common.abstract_recommender import GeneralRecommender
 from common.loss import BPRLoss, EmbLoss
 
-class DynamicGraphUpdate(nn.Module):
-    def __init__(self, n_users, n_items, embedding_dim):
-        super(DynamicGraphUpdate, self).__init__()
-        self.n_users = n_users
-        self.n_items = n_items
+class MultiLevelFeatureFusion(nn.Module):
+    def __init__(self, embedding_dim):
+        super(MultiLevelFeatureFusion, self).__init__()
         self.embedding_dim = embedding_dim
-        self.user_gru = nn.GRU(embedding_dim, embedding_dim, batch_first=True)
-        self.item_gru = nn.GRU(embedding_dim, embedding_dim, batch_first=True)
-        self.user_embeddings = nn.Embedding(n_users, embedding_dim)
-        self.item_embeddings = nn.Embedding(n_items, embedding_dim)
-        nn.init.xavier_uniform_(self.user_embeddings.weight)
-        nn.init.xavier_uniform_(self.item_embeddings.weight)
+        self.weight_text = Parameter(torch.Tensor(1))
+        self.weight_image = Parameter(torch.Tensor(1))
+        self.weight_collaborative = Parameter(torch.Tensor(1))
+        nn.init.constant_(self.weight_text, 1.0)
+        nn.init.constant_(self.weight_image, 1.0)
+        nn.init.constant_(self.weight_collaborative, 1.0)
 
-    def forward(self, user_sequence, item_sequence):
-        user_embed = self.user_embeddings(user_sequence)
-        item_embed = self.item_embeddings(item_sequence)
-        user_output, _ = self.user_gru(user_embed.unsqueeze(1))
-        item_output, _ = self.item_gru(item_embed.unsqueeze(1))
-        return user_output[:, -1, :], item_output[:, -1, :]
-
-
-class MultimodalGraphAggregationLayer(MessagePassing):
-    def __init__(self, in_channels, out_channels):
-        super(MultimodalGraphAggregationLayer, self).__init__(aggr='mean')
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.linear = nn.Linear(in_channels, out_channels)
-        nn.init.xavier_uniform_(self.linear.weight)
-
-    def forward(self, x, edge_index):
-        x = self.linear(x)
-        edge_index, _ = dropout_adj(edge_index, p=0.2)
-        return self.propagate(edge_index, x=x, size=(x.size(0), x.size(0)))
-
-    def message(self, x_j):
-        return x_j
-
-
-class TemporalSelfAttentionEncoder(nn.Module):
-    def __init__(self, embedding_dim, num_heads):
-        super(TemporalSelfAttentionEncoder, self).__init__()
-        self.embedding_dim = embedding_dim
-        self.num_heads = num_heads
-        self.self_attention = nn.MultiheadAttention(embedding_dim, num_heads, batch_first=True)
-
-    def forward(self, x):
-        attn_output, _ = self.self_attention(x, x, x)
-        return attn_output
+    def forward(self, text_feat, image_feat, collaborative_feat):
+        # Weighted average fusion of different modalities
+        combined_feat = (
+            self.weight_text * text_feat +
+            self.weight_image * image_feat +
+            self.weight_collaborative * collaborative_feat
+        ) / (self.weight_text + self.weight_image + self.weight_collaborative)
+        return combined_feat
 
 
 class AMGAN(GeneralRecommender):
@@ -72,12 +40,16 @@ class AMGAN(GeneralRecommender):
         self.num_user = self.n_users
         self.num_item = self.n_items
         self.embedding_dim = config['embedding_size']
-        self.num_heads = config['num_heads']
         self.reg_weight = config['reg_weight']
-        self.dynamic_graph = DynamicGraphUpdate(self.num_user, self.num_item, self.embedding_dim)
-        self.graph_aggregation = MultimodalGraphAggregationLayer(self.embedding_dim, self.embedding_dim)
-        self.temporal_attention = TemporalSelfAttentionEncoder(self.embedding_dim, self.num_heads)
+        self.contrastive_weight = config['contrastive_weight']
 
+        # User and Item Embeddings
+        self.user_embedding = nn.Embedding(self.num_user, self.embedding_dim)
+        self.item_embedding = nn.Embedding(self.num_item, self.embedding_dim)
+        nn.init.xavier_uniform_(self.user_embedding.weight)
+        nn.init.xavier_uniform_(self.item_embedding.weight)
+
+        # Multimodal Embeddings for Items
         if self.v_feat is not None:
             self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
             self.image_trs = nn.Linear(self.v_feat.shape[1], self.embedding_dim)
@@ -87,49 +59,69 @@ class AMGAN(GeneralRecommender):
             self.text_trs = nn.Linear(self.t_feat.shape[1], self.embedding_dim)
             nn.init.xavier_uniform_(self.text_trs.weight)
 
-        # Initialize edge_index for training
-        train_interactions = dataset.inter_matrix(form='coo').astype(np.float32)
-        edge_index = torch.tensor(self.pack_edge_index(train_interactions), dtype=torch.long)
-        self.edge_index = edge_index.t().contiguous().to(self.device)
+        # Feature Fusion Module
+        self.fusion = MultiLevelFeatureFusion(self.embedding_dim)
 
-    def pack_edge_index(self, inter_mat):
-        rows = inter_mat.row
-        cols = inter_mat.col + self.n_users
-        return np.column_stack((rows, cols))
+    def forward(self, user_indices, item_indices):
+        user_embed = self.user_embedding(user_indices)
+        item_embed = self.item_embedding(item_indices)
 
-    def forward(self, user_sequence, item_sequence):
-        user_output, item_output = self.dynamic_graph(user_sequence, item_sequence)
-        x = torch.cat((user_output, item_output), dim=0)
-        edge_index = torch.cat((self.edge_index, self.edge_index[[1, 0]]), dim=1)
-        multimodal_rep = self.graph_aggregation(x, edge_index)
-
+        # Get multimodal item embeddings
         if self.v_feat is not None:
-            visual_features = F.relu(self.image_trs(self.image_embedding.weight))
-            multimodal_rep[:visual_features.size(0), :] += visual_features  # Adjust dimensions to match
-        if self.t_feat is not None:
-            textual_features = F.relu(self.text_trs(self.text_embedding.weight))
-            multimodal_rep[:textual_features.size(0), :] += textual_features  # Adjust dimensions to match
+            image_feat = F.relu(self.image_trs(self.image_embedding(item_indices)))
+        else:
+            image_feat = torch.zeros_like(item_embed)
 
-        temporal_output = self.temporal_attention(multimodal_rep.unsqueeze(0))
-        return temporal_output.squeeze(0)
+        if self.t_feat is not None:
+            text_feat = F.relu(self.text_trs(self.text_embedding(item_indices)))
+        else:
+            text_feat = torch.zeros_like(item_embed)
+
+        # Fusion of multimodal features
+        combined_item_feat = self.fusion(text_feat, image_feat, item_embed)
+        return user_embed, combined_item_feat
 
     def calculate_loss(self, interaction):
-        user_sequence = interaction[0]
-        pos_item_sequence = interaction[1]
-        neg_item_sequence = interaction[2]
-        pos_output = self.forward(user_sequence, pos_item_sequence)
-        neg_output = self.forward(user_sequence, neg_item_sequence)
+        user_indices = interaction[0]
+        pos_item_indices = interaction[1]
+        neg_item_indices = interaction[2]
 
-        pos_scores = torch.sum(pos_output * self.dynamic_graph.item_embeddings(pos_item_sequence), dim=1)
-        neg_scores = torch.sum(neg_output * self.dynamic_graph.item_embeddings(neg_item_sequence), dim=1)
-        loss = -torch.mean(torch.log(torch.sigmoid(pos_scores - neg_scores)))
-        reg_loss = self.reg_weight * (self.dynamic_graph.user_embeddings.weight ** 2).mean()
-        reg_loss += self.reg_weight * (self.dynamic_graph.item_embeddings.weight ** 2).mean()
-        return loss + reg_loss
+        # Forward Pass
+        user_embed, pos_item_embed = self.forward(user_indices, pos_item_indices)
+        _, neg_item_embed = self.forward(user_indices, neg_item_indices)
+
+        # BPR Loss
+        pos_scores = torch.sum(user_embed * pos_item_embed, dim=1)
+        neg_scores = torch.sum(user_embed * neg_item_embed, dim=1)
+        bpr_loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
+
+        # Contrastive Loss
+        contrastive_loss = torch.mean((user_embed - pos_item_embed) ** 2) - torch.mean((user_embed - neg_item_embed) ** 2)
+        contrastive_loss = torch.clamp(contrastive_loss, min=0)
+
+        # Regularization Loss
+        reg_loss = self.reg_weight * ((self.user_embedding.weight ** 2).mean() + (self.item_embedding.weight ** 2).mean())
+
+        return bpr_loss + self.contrastive_weight * contrastive_loss + reg_loss
 
     def full_sort_predict(self, interaction):
-        user_sequence = interaction[0]
-        user_output = self.dynamic_graph.user_embeddings(user_sequence)
-        item_output = self.dynamic_graph.item_embeddings.weight
-        scores = torch.matmul(user_output, item_output.t())
+        user_indices = interaction[0]
+        user_embed = self.user_embedding(user_indices)
+        item_embed = self.item_embedding.weight
+
+        if self.v_feat is not None:
+            image_feat = F.relu(self.image_trs(self.image_embedding.weight))
+        else:
+            image_feat = torch.zeros_like(item_embed)
+
+        if self.t_feat is not None:
+            text_feat = F.relu(self.text_trs(self.text_embedding.weight))
+        else:
+            text_feat = torch.zeros_like(item_embed)
+
+        # Fusion of multimodal features for all items
+        combined_item_feat = self.fusion(text_feat, image_feat, item_embed)
+
+        # Dot product between user and all items
+        scores = torch.matmul(user_embed, combined_item_feat.t())
         return scores

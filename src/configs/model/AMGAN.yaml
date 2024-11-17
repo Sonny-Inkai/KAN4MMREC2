@@ -1,21 +1,32 @@
+model: CMFFN
+
+# Training Configuration
+train_batch_size: 256
+learning_rate: 0.001
+num_epochs: 50
+reg_weight: 0.01
+contrastive_weight: 0.1
+device: cuda
+seed: 999
+
+# Embedding Configuration
 embedding_size: 32
-feat_embed_dim: 32
-n_layers: 1
-dropout: 0.1
-cl_weight: 1.0
-reg_weight: 2e-04
-knn_k: 10
-lambda_coeff: 0.5
-reward_gamma: 0.99
-contextual_factor: 0.2
-time_decay: 0.8
+
+# Dataset Configuration
+data_path: "./data/"
+dataset: "MovieLens"
+
+# Model-Specific Parameters
 num_heads: 4
-ssl_temp: 0.1 
-ssl_reg: 0.1
-knn_k: 10
 
+# Optimizer Configuration
+optimizer: Adam
 
+# Data Processing
+use_multimodal: True
+v_feat_path: "./data/image_features.npy"
+t_feat_path: "./data/text_features.npy"
 
-
-
-
+# Evaluation Configuration
+eval_batch_size: 256
+eval_metrics: ["Precision@5", "Recall@5", "NDCG@5"]
