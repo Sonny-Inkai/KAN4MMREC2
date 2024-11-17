@@ -52,9 +52,9 @@ class MultimodalGraphAttentionLayer(MessagePassing):
         edge_index, _ = dropout_adj(edge_index, p=0.2)
         return self.propagate(edge_index, x=x, size=(x.size(0), x.size(0)))
 
-    def message(self, x_j, edge_index_i, size):
+    def message(self, x_j, index, ptr, size_i):
         alpha = torch.matmul(x_j, self.attention_weights)
-        alpha = softmax(alpha, edge_index_i, num_nodes=size[0])
+        alpha = softmax(alpha, index, ptr, size_i)
         return x_j * alpha
 
 
