@@ -15,7 +15,6 @@ from torch_geometric.nn.conv import MessagePassing
 from torch_geometric.utils import dropout_adj, softmax
 from common.abstract_recommender import GeneralRecommender
 from common.loss import BPRLoss, EmbLoss
-from common.init import xavier_uniform_initialization
 
 class DynamicGraphUpdate(nn.Module):
     def __init__(self, n_users, n_items, embedding_dim):
@@ -45,7 +44,7 @@ class MultimodalGraphAttentionLayer(MessagePassing):
         self.out_channels = out_channels
         self.linear = nn.Linear(in_channels, out_channels)
         self.attention_weights = Parameter(torch.Tensor(out_channels, 1))
-        xavier_uniform_initialization(self.attention_weights)
+        nn.init.xavier_uniform_(self.attention_weights)
 
     def forward(self, x, edge_index):
         x = self.linear(x)
