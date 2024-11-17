@@ -12,7 +12,7 @@ import torch.nn.functional as F
 import numpy as np
 from torch.nn import Parameter
 from torch_geometric.nn.conv import MessagePassing
-from torch_geometric.utils import dropout_adj, softmax
+from torch_geometric.utils import dropout_adj
 from common.abstract_recommender import GeneralRecommender
 from common.loss import BPRLoss, EmbLoss
 
@@ -37,24 +37,21 @@ class DynamicGraphUpdate(nn.Module):
         return user_output[:, -1, :], item_output[:, -1, :]
 
 
-class MultimodalGraphAttentionLayer(MessagePassing):
+class MultimodalGraphAggregationLayer(MessagePassing):
     def __init__(self, in_channels, out_channels):
-        super(MultimodalGraphAttentionLayer, self).__init__(aggr='add')
+        super(MultimodalGraphAggregationLayer, self).__init__(aggr='mean')
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.linear = nn.Linear(in_channels, out_channels)
-        self.attention_weights = Parameter(torch.Tensor(out_channels, 1))
-        nn.init.xavier_uniform_(self.attention_weights)
+        nn.init.xavier_uniform_(self.linear.weight)
 
     def forward(self, x, edge_index):
         x = self.linear(x)
         edge_index, _ = dropout_adj(edge_index, p=0.2)
         return self.propagate(edge_index, x=x, size=(x.size(0), x.size(0)))
 
-    def message(self, x_j, index, ptr, size_i):
-        alpha = torch.matmul(x_j, self.attention_weights)
-        alpha = softmax(alpha, index, ptr, size_i)
-        return x_j * alpha
+    def message(self, x_j):
+        return x_j
 
 
 class TemporalSelfAttentionEncoder(nn.Module):
@@ -78,7 +75,7 @@ class AMGAN(GeneralRecommender):
         self.num_heads = config['num_heads']
         self.reg_weight = config['reg_weight']
         self.dynamic_graph = DynamicGraphUpdate(self.num_user, self.num_item, self.embedding_dim)
-        self.graph_attention = MultimodalGraphAttentionLayer(self.embedding_dim, self.embedding_dim)
+        self.graph_aggregation = MultimodalGraphAggregationLayer(self.embedding_dim, self.embedding_dim)
         self.temporal_attention = TemporalSelfAttentionEncoder(self.embedding_dim, self.num_heads)
 
         if self.v_feat is not None:
@@ -104,7 +101,7 @@ class AMGAN(GeneralRecommender):
         user_output, item_output = self.dynamic_graph(user_sequence, item_sequence)
         x = torch.cat((user_output, item_output), dim=0)
         edge_index = torch.cat((self.edge_index, self.edge_index[[1, 0]]), dim=1)
-        multimodal_rep = self.graph_attention(x, edge_index)
+        multimodal_rep = self.graph_aggregation(x, edge_index)
 
         if self.v_feat is not None:
             visual_features = F.relu(self.image_trs(self.image_embedding.weight))
