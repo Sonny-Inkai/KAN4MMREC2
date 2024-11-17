@@ -35,7 +35,7 @@ class DynamicGraphUpdate(nn.Module):
         item_embed = self.item_embeddings(item_sequence)
         user_output, _ = self.user_gru(user_embed)
         item_output, _ = self.item_gru(item_embed)
-        return user_output[:, -1, :], item_output[:, -1, :]
+        return user_output[:, -1], item_output[:, -1]
 
 
 class MultimodalGraphAttentionLayer(MessagePassing):
