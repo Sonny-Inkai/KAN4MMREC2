@@ -45,7 +45,7 @@ class MultimodalGraphAttentionLayer(MessagePassing):
         self.out_channels = out_channels
         self.linear = nn.Linear(in_channels, out_channels)
         self.attention_weights = Parameter(torch.Tensor(out_channels, 1))
-        nn.init.xavier_uniform_(self.attention_weights)
+        xavier_uniform_initialization(self.attention_weights)
 
     def forward(self, x, edge_index):
         x = self.linear(x)
@@ -109,12 +109,10 @@ class AMGAN(GeneralRecommender):
 
         if self.v_feat is not None:
             visual_features = F.relu(self.image_trs(self.image_embedding.weight))
-            visual_features = visual_features[:multimodal_rep.size(0), :]  # Adjust dimensions to match
-            multimodal_rep += visual_features
+            multimodal_rep += visual_features[:multimodal_rep.size(0), :]  # Adjust dimensions to match
         if self.t_feat is not None:
             textual_features = F.relu(self.text_trs(self.text_embedding.weight))
-            textual_features = textual_features[:multimodal_rep.size(0), :]  # Adjust dimensions to match
-            multimodal_rep += textual_features
+            multimodal_rep += textual_features[:multimodal_rep.size(0), :]  # Adjust dimensions to match
 
         temporal_output = self.temporal_attention(multimodal_rep.unsqueeze(0))
         return temporal_output.squeeze(0)
