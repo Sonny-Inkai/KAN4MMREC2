@@ -91,10 +91,12 @@ class AMGAN(GeneralRecommender):
             self.text_trs = nn.Linear(self.t_feat.shape[1], self.embedding_dim)
             nn.init.xavier_uniform_(self.text_trs.weight)
 
-        # Initialize edge_index for training
-        train_interactions = dataset.inter_matrix(form='coo').astype(np.float32)
-        edge_index = torch.tensor(self.pack_edge_index(train_interactions), dtype=torch.long)
-        self.edge_index = edge_index.t().contiguous().to(self.device)
+        # packing interaction in training into edge_index
+        train_interactions = dataset.inter_matrix(form="coo").astype(np.float32)
+        edge_index = self.pack_edge_index(train_interactions)
+        self.edge_index = (
+            torch.tensor(edge_index, dtype=torch.long).t().contiguous().to(self.device)
+        )
 
     def pack_edge_index(self, inter_mat):
         rows = inter_mat.row
