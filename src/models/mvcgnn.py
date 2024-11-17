@@ -10,9 +10,9 @@ import numpy as np
 import scipy.sparse as sp
 from common.abstract_recommender import GeneralRecommender
 
-class MTGATRec(GeneralRecommender):
+class MCVGNN(GeneralRecommender):
     def __init__(self, config, dataset):
-        super(MTGATRec, self).__init__(config, dataset)
+        super(MCVGNN, self).__init__(config, dataset)
         
         self.embedding_dim = config['embedding_size']
         self.n_layers = config['n_layers']
