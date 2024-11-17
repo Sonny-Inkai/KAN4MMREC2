@@ -28,7 +28,6 @@ class AMGAN(GeneralRecommender):
         self.n_layers = config["n_layers"]
         self.dropout_rate = config["dropout"]
         
-        self.n_users, self.n_items = dataset.n_users, dataset.n_items
         self.n_nodes = self.n_users + self.n_items
 
         # Graph adjacency matrix and normalization
