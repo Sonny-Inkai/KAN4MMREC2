@@ -91,22 +91,20 @@ class AMGAN(GeneralRecommender):
             self.text_trs = nn.Linear(self.t_feat.shape[1], self.embedding_dim)
             nn.init.xavier_uniform_(self.text_trs.weight)
 
-        # packing interaction in training into edge_index
-        train_interactions = dataset.inter_matrix(form="coo").astype(np.float32)
-        edge_index = self.pack_edge_index(train_interactions)
-        self.edge_index = (
-            torch.tensor(edge_index, dtype=torch.long).t().contiguous().to(self.device)
-        )
+        # Initialize edge_index for training
+        train_interactions = dataset.inter_matrix(form='coo').astype(np.float32)
+        edge_index = torch.tensor(self.pack_edge_index(train_interactions), dtype=torch.long)
+        self.edge_index = edge_index.t().contiguous().to(self.device)
 
     def pack_edge_index(self, inter_mat):
         rows = inter_mat.row
         cols = inter_mat.col + self.n_users
         return np.column_stack((rows, cols))
 
-    def forward(self, user_sequence, item_sequence, edge_index):
+    def forward(self, user_sequence, item_sequence):
         user_output, item_output = self.dynamic_graph(user_sequence, item_sequence)
         x = torch.cat((user_output, item_output), dim=0)
-        edge_index = torch.cat((edge_index, edge_index[[1, 0]]), dim=1)
+        edge_index = torch.cat((self.edge_index, self.edge_index[[1, 0]]), dim=1)
         multimodal_rep = self.graph_attention(x, edge_index)
 
         if self.v_feat is not None:
@@ -123,11 +121,11 @@ class AMGAN(GeneralRecommender):
         user_sequence = interaction[0]
         pos_item_sequence = interaction[1]
         neg_item_sequence = interaction[2]
-        pos_output = self.forward(user_sequence, pos_item_sequence, self.edge_index)
-        neg_output = self.forward(user_sequence, neg_item_sequence, self.edge_index)
+        pos_output = self.forward(user_sequence, pos_item_sequence)
+        neg_output = self.forward(user_sequence, neg_item_sequence)
 
-        pos_scores = torch.sum(pos_output * pos_item_sequence, dim=1)
-        neg_scores = torch.sum(neg_output * neg_item_sequence, dim=1)
+        pos_scores = torch.sum(pos_output * self.dynamic_graph.item_embeddings(pos_item_sequence), dim=1)
+        neg_scores = torch.sum(neg_output * self.dynamic_graph.item_embeddings(neg_item_sequence), dim=1)
         loss = -torch.mean(torch.log(torch.sigmoid(pos_scores - neg_scores)))
         reg_loss = self.reg_weight * (self.dynamic_graph.user_embeddings.weight ** 2).mean()
         reg_loss += self.reg_weight * (self.dynamic_graph.item_embeddings.weight ** 2).mean()
