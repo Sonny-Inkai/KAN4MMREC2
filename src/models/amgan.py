@@ -45,7 +45,7 @@ class MultimodalGraphAttentionLayer(MessagePassing):
         self.out_channels = out_channels
         self.linear = nn.Linear(in_channels, out_channels)
         self.attention_weights = Parameter(torch.Tensor(out_channels, 1))
-        xavier_uniform_initialization(self.attention_weights)
+        nn.init.xavier_uniform_(self.attention_weights)
 
     def forward(self, x, edge_index):
         x = self.linear(x)
