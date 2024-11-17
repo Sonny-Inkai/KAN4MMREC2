@@ -62,7 +62,7 @@ class AMGAN(GeneralRecommender):
             nn.init.xavier_uniform_(self.text_trs.weight)
 
         # Cross-Modal Transformer Module
-        self.cross_modal_transformer = CrossModalTransformer(self.embedding_dim, num_heads=4, num_layers=2)
+        self.cross_modal_transformer = CrossModalTransformer(self.embedding_dim, num_heads=8, num_layers=4)
 
         # Hierarchical Attention Module
         self.hierarchical_attention = HierarchicalAttention(self.embedding_dim)
