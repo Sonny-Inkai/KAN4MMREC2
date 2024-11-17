@@ -1,32 +1,7 @@
-model: CMFFN
 
-# Training Configuration
-train_batch_size: 256
-learning_rate: 0.001
-num_epochs: 50
 reg_weight: 0.01
 contrastive_weight: 0.1
-device: cuda
-seed: 999
+
 
 # Embedding Configuration
 embedding_size: 32
-
-# Dataset Configuration
-data_path: "./data/"
-dataset: "MovieLens"
-
-# Model-Specific Parameters
-num_heads: 4
-
-# Optimizer Configuration
-optimizer: Adam
-
-# Data Processing
-use_multimodal: True
-v_feat_path: "./data/image_features.npy"
-t_feat_path: "./data/text_features.npy"
-
-# Evaluation Configuration
-eval_batch_size: 256
-eval_metrics: ["Precision@5", "Recall@5", "NDCG@5"]
