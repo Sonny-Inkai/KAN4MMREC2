@@ -17,7 +17,6 @@ from common.abstract_recommender import GeneralRecommender
 from common.loss import BPRLoss, EmbLoss
 from common.init import xavier_uniform_initialization
 
-
 class DynamicGraphUpdate(nn.Module):
     def __init__(self, n_users, n_items, embedding_dim):
         super(DynamicGraphUpdate, self).__init__()
@@ -34,9 +33,9 @@ class DynamicGraphUpdate(nn.Module):
     def forward(self, user_sequence, item_sequence):
         user_embed = self.user_embeddings(user_sequence)
         item_embed = self.item_embeddings(item_sequence)
-        user_output, _ = self.user_gru(user_embed)
-        item_output, _ = self.item_gru(item_embed)
-        return user_output[:, -1], item_output[:, -1]
+        user_output, _ = self.user_gru(user_embed.unsqueeze(1))
+        item_output, _ = self.item_gru(item_embed.unsqueeze(1))
+        return user_output[:, -1, :], item_output[:, -1, :]
 
 
 class MultimodalGraphAttentionLayer(MessagePassing):
@@ -106,14 +105,15 @@ class AMGAN(GeneralRecommender):
         user_output, item_output = self.dynamic_graph(user_sequence, item_sequence)
         x = torch.cat((user_output, item_output), dim=0)
         edge_index = torch.cat((self.edge_index, self.edge_index[[1, 0]]), dim=1)
-
-        # Project visual and textual embeddings
         multimodal_rep = self.graph_attention(x, edge_index)
+
         if self.v_feat is not None:
             visual_features = F.relu(self.image_trs(self.image_embedding.weight))
+            visual_features = visual_features[:multimodal_rep.size(0), :]  # Adjust dimensions to match
             multimodal_rep += visual_features
         if self.t_feat is not None:
             textual_features = F.relu(self.text_trs(self.text_embedding.weight))
+            textual_features = textual_features[:multimodal_rep.size(0), :]  # Adjust dimensions to match
             multimodal_rep += textual_features
 
         temporal_output = self.temporal_attention(multimodal_rep.unsqueeze(0))
