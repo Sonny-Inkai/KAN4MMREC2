@@ -1,136 +1,93 @@
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import MessagePassing
-from torch_geometric.utils import degree
-import scipy.sparse as sp
-import numpy as np
-
+from torch_geometric.nn import GATConv, MessagePassing
 
 from common.abstract_recommender import GeneralRecommender
-from common.loss import BPRLoss, EmbLoss, L2Loss
-from utils.utils import build_sim, compute_normalized_laplacian
+from common.loss import BPRLoss, EmbLoss
 
-# Proposed SOTA Model for Multimodal Recommendation
 class PHOENIX(GeneralRecommender):
     def __init__(self, config, dataset):
-        super(PHOENIX, self).__init__()
-        self.embedding_dim = config['embedding_size']
-        self.feat_embed_dim = config['feat_embed_dim']
-        self.knn_k = config['knn_k']
-        self.lambda_coeff = config['lambda_coeff']
-        self.cf_model = config['cf_model']
-        self.n_layers = config['n_layers']
-        self.reg_weight = config['reg_weight']
-        self.device = config['device']
+        super(PHOENIX, self).__init__(config, dataset)
 
-        # Load dataset information
-        self.n_nodes = self.n_users + self.n_items
-        self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
-        self.norm_adj = self.get_norm_adj_mat(self.interaction_matrix).to(self.device)
+        self.embedding_dim = config["embedding_size"]
+        self.feat_embed_dim = config["feat_embed_dim"]
+        self.n_layers = config["n_mm_layers"]
+        self.reg_weight = config["reg_weight"]
+        self.cl_weight = config["cl_weight"]
+        self.dropout = config["dropout"]
 
-        # Embedding layers
+        # Modality-specific embeddings
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
         self.item_embedding = nn.Embedding(self.n_items, self.embedding_dim)
         nn.init.xavier_uniform_(self.user_embedding.weight)
         nn.init.xavier_uniform_(self.item_embedding.weight)
 
-        if dataset.v_feat is not None:
-            self.image_embedding = nn.Embedding.from_pretrained(dataset.v_feat, freeze=False)
-            self.image_trs = nn.Linear(dataset.v_feat.shape[1], self.feat_embed_dim)
-            nn.init.xavier_normal_(self.image_trs.weight)
+        if self.v_feat is not None:
+            self.visual_embedding = nn.Linear(self.v_feat.size(1), self.feat_embed_dim)
+        if self.t_feat is not None:
+            self.textual_embedding = nn.Linear(self.t_feat.size(1), self.feat_embed_dim)
 
-        if dataset.t_feat is not None:
-            self.text_embedding = nn.Embedding.from_pretrained(dataset.t_feat, freeze=False)
-            self.text_trs = nn.Linear(dataset.t_feat.shape[1], self.feat_embed_dim)
-            nn.init.xavier_normal_(self.text_trs.weight)
+        # Graph attention layers
+        self.gat_visual = GATConv(self.feat_embed_dim, self.embedding_dim, heads=4)
+        self.gat_textual = GATConv(self.feat_embed_dim, self.embedding_dim, heads=4)
+        self.gat_cross = GATConv(self.embedding_dim, self.embedding_dim, heads=4)
 
-        # Graph learning components
-        self.graph_layers = nn.ModuleList([GraphLayer(self.embedding_dim) for _ in range(self.n_layers)])
-        self.cross_modal_correction = CrossModalCorrection(self.embedding_dim)
-        self.transformer_encoder = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model=self.embedding_dim, nhead=8, dropout=config['dropout']),
-            num_layers=config['n_layers']
-        )
+        # Cross-modal attention
+        self.cross_attention = nn.MultiheadAttention(self.embedding_dim, num_heads=4)
 
-    def get_norm_adj_mat(self, interaction_matrix):
-        A = sp.dok_matrix((self.n_users + self.n_items, self.n_users + self.n_items), dtype=np.float32)
-        inter_M = interaction_matrix
-        inter_M_t = interaction_matrix.transpose()
-        data_dict = dict(zip(zip(inter_M.row, inter_M.col + self.n_users), [1] * inter_M.nnz))
-        data_dict.update(dict(zip(zip(inter_M_t.row + self.n_users, inter_M_t.col), [1] * inter_M_t.nnz)))
-        for key, value in data_dict.items():
-            A[key] = value
-        sumArr = (A > 0).sum(axis=1)
-        diag = np.array(sumArr.flatten()).astype(np.float32) + 1e-7
-        diag = np.power(diag, -0.5)
-        D = sp.diags(diag)
-        L = D * A * D
-        L = sp.coo_matrix(L)
-        row = L.row
-        col = L.col
-        i = torch.LongTensor(np.array([row, col]))
-        data = torch.FloatTensor(L.data)
-        return torch.sparse.FloatTensor(i, data, torch.Size((self.n_nodes, self.n_nodes)))
+        # Predictor and regularization
+        self.predictor = nn.Linear(self.embedding_dim, 1)
+        self.reg_loss = EmbLoss()
 
-    def forward(self, users, items):
-        user_emb = self.user_embedding(users)
-        item_emb = self.item_embedding(items)
+    def forward(self, interaction):
+        user = interaction[0]
+        item_pos = interaction[1]
+        item_neg = interaction[2]
 
-        # Graph learning and propagation
-        ego_embeddings = torch.cat([self.user_embedding.weight, self.item_embedding.weight], dim=0)
-        for layer in self.graph_layers:
-            ego_embeddings = layer(self.norm_adj, ego_embeddings)
-        user_graph_emb, item_graph_emb = torch.split(ego_embeddings, [self.n_users, self.n_items], dim=0)
+        # Modality-specific embeddings
+        visual_emb = F.relu(self.visual_embedding(self.v_feat)) if self.v_feat is not None else 0
+        textual_emb = F.relu(self.textual_embedding(self.t_feat)) if self.t_feat is not None else 0
 
-        # Cross-modal correction mechanism
-        user_corrected, item_corrected = self.cross_modal_correction(user_graph_emb, item_graph_emb)
+        # GAT propagation
+        visual_rep = self.gat_visual(visual_emb, self.mm_adj)
+        textual_rep = self.gat_textual(textual_emb, self.mm_adj)
 
-        # Transformer encoder for final user-item representation
-        user_final = self.transformer_encoder(user_corrected.unsqueeze(0)).squeeze(0)
-        item_final = self.transformer_encoder(item_corrected.unsqueeze(0)).squeeze(0)
+        # Cross-modal aggregation
+        cross_rep, _ = self.cross_attention(visual_rep.unsqueeze(1), textual_rep.unsqueeze(1), textual_rep.unsqueeze(1))
+        cross_rep = cross_rep.squeeze(1)
 
-        user_out = user_final[users]
-        item_out = item_final[items]
+        # Combine user-item interactions
+        user_emb = self.user_embedding[user]
+        item_pos_emb = self.item_embedding[item_pos]
+        item_neg_emb = self.item_embedding[item_neg]
 
-        return torch.sum(user_out * item_out, dim=1)
+        # Final embeddings
+        user_item_pos = user_emb * item_pos_emb + cross_rep
+        user_item_neg = user_emb * item_neg_emb + cross_rep
+
+        pos_scores = self.predictor(user_item_pos).squeeze(-1)
+        neg_scores = self.predictor(user_item_neg).squeeze(-1)
+
+        return pos_scores, neg_scores
 
     def calculate_loss(self, interaction):
-        users, pos_items, neg_items = interaction
-        pos_scores = self.forward(users, pos_items)
-        neg_scores = self.forward(users, neg_items)
-        loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
-        reg_loss = self.reg_weight * (
-            self.user_embedding.weight.norm(2).pow(2) +
-            self.item_embedding.weight.norm(2).pow(2)
-        )
-        return loss + reg_loss
+        pos_scores, neg_scores = self.forward(interaction)
 
-class GraphLayer(MessagePassing):
-    def __init__(self, in_channels):
-        super(GraphLayer, self).__init__(aggr='add')
-        self.linear = nn.Linear(in_channels, in_channels)
-        nn.init.xavier_uniform_(self.linear.weight)
+        # Recommendation loss
+        rec_loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
 
-    def forward(self, edge_index, x):
-        x = self.linear(x)
-        return self.propagate(edge_index, x=x)
+        # Modality alignment loss
+        align_loss = self.cl_weight * (1 - F.cosine_similarity(self.v_feat, self.t_feat, dim=-1).mean())
 
-    def message(self, x_j, edge_index, size):
-        row, col = edge_index
-        deg = degree(row, size[0], dtype=x_j.dtype)
-        deg_inv_sqrt = deg.pow(-0.5)
-        norm = deg_inv_sqrt[row] * deg_inv_sqrt[col]
-        return norm.view(-1, 1) * x_j
+        # Regularization
+        reg_loss = self.reg_weight * self.reg_loss(self.user_embedding.weight, self.item_embedding.weight)
 
-class CrossModalCorrection(nn.Module):
-    def __init__(self, embedding_dim):
-        super(CrossModalCorrection, self).__init__()
-        self.transform = nn.Linear(embedding_dim, embedding_dim)
-        nn.init.xavier_uniform_(self.transform.weight)
+        return rec_loss + align_loss + reg_loss
 
-    def forward(self, user_emb, item_emb):
-        corrected_user = self.transform(user_emb)
-        corrected_item = self.transform(item_emb)
-        return corrected_user, corrected_item
+    def full_sort_predict(self, interaction):
+        user = interaction[0]
+        user_emb = self.user_embedding[user]
+        item_emb = self.item_embedding.weight
+        scores = torch.matmul(user_emb, item_emb.t())
+        return scores
