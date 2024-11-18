@@ -55,7 +55,7 @@ class AMGAN(GeneralRecommender):
             nn.init.xavier_normal_(self.text_trs.weight)
 
         # Self-Attention Layers for Graph Information
-        self.attention_layer = GATConv(self.embedding_dim, self.embedding_dim, heads=2, concat=True)
+        self.attention_layer = GATConv(self.embedding_dim, self.embedding_dim // 2, heads=2, concat=True)
 
     def get_norm_adj_mat(self, interaction_matrix):
         A = sp.dok_matrix((self.n_users + self.n_items,
