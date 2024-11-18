@@ -10,13 +10,13 @@ class PHOENIX(GeneralRecommender):
         super(PHOENIX, self).__init__(config, dataset)
         
         # Model Configurations
-        self.embedding_dim = config.get("embedding_size", 64)
-        self.n_layers = config.get("n_gnn_layers", 3)
-        self.knn_k = config.get("knn_k", 20)
-        self.reg_weight = config.get("reg_weight", 1e-5)
-        self.cl_weight = config.get("cl_weight", 0.1)
-        self.dropout = config.get("dropout", 0.1)
-        self.device = config.get("device", "cpu")
+        self.embedding_dim = config["embedding_size"] if "embedding_size" in config else 64
+        self.n_layers = config["n_gnn_layers"] if "n_gnn_layers" in config else 3
+        self.knn_k = config["knn_k"] if "knn_k" in config else 20
+        self.reg_weight = config["reg_weight"] if "reg_weight" in config else 1e-5
+        self.cl_weight = config["cl_weight"] if "cl_weight" in config else 0.1
+        self.dropout = config["dropout"] if "dropout" in config else 0.1
+        self.device = config["device"] if "device" in config else "cpu"
         
         # Embeddings
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
