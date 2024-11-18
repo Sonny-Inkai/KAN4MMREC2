@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import numpy as np
 import scipy.sparse as sp
 from torch_geometric.nn import GATConv
-from torch_geometric.utils import add_self_loops, remove_self_loops
+from torch_geometric.utils import add_self_loops
 
 from common.abstract_recommender import GeneralRecommender
 
@@ -32,22 +32,39 @@ class PHOENIX(GeneralRecommender):
         nn.init.xavier_uniform_(self.user_embedding.weight)
         nn.init.xavier_uniform_(self.item_embedding.weight)
 
+        # Feature transformations
         if self.v_feat is not None:
-            self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
-            self.image_trs = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
-            nn.init.xavier_normal_(self.image_trs.weight)
+            self.v_feat = F.normalize(self.v_feat, dim=1)
+            self.v_linear = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
+            nn.init.xavier_uniform_(self.v_linear.weight)
+        else:
+            self.v_linear = None
+
         if self.t_feat is not None:
-            self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
-            self.text_trs = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
-            nn.init.xavier_normal_(self.text_trs.weight)
+            self.t_feat = F.normalize(self.t_feat, dim=1)
+            self.t_linear = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
+            nn.init.xavier_uniform_(self.t_linear.weight)
+        else:
+            self.t_linear = None
 
         # Attention-based GNN layers
         self.gnn_layers = nn.ModuleList()
         for _ in range(self.n_layers):
-            self.gnn_layers.append(GATConv(self.embedding_dim, self.embedding_dim, heads=self.num_heads, dropout=self.dropout_rate))
+            self.gnn_layers.append(
+                GATConv(
+                    self.embedding_dim,
+                    self.embedding_dim,
+                    heads=self.num_heads,
+                    dropout=self.dropout_rate,
+                    concat=False  # Set concat=False to keep the output dimension consistent
+                )
+            )
 
         # Modality attention
-        self.modality_attention = nn.Linear(self.feat_embed_dim, 1)
+        if self.v_feat is not None and self.t_feat is not None:
+            self.modality_attention = nn.Linear(self.feat_embed_dim, 1)
+        else:
+            self.modality_attention = None
 
         # Loss functions
         self.bce_loss = nn.BCEWithLogitsLoss()
@@ -64,11 +81,14 @@ class PHOENIX(GeneralRecommender):
         # Edges
         user_item_edges = np.vstack((user_item_matrix.row, user_item_matrix.col + self.n_users))
         item_user_edges = np.vstack((user_item_matrix.col + self.n_users, user_item_matrix.row))
-        self.edge_index = np.hstack((user_item_edges, item_user_edges))
+        edge_index = np.hstack((user_item_edges, item_user_edges))
+
+        # Convert to tensor
+        edge_index = torch.tensor(edge_index, dtype=torch.long)
 
         # Add self-loops
-        self.edge_index, _ = add_self_loops(torch.tensor(self.edge_index, dtype=torch.long), num_nodes=self.num_nodes)
-        self.edge_index = self.edge_index.to(self.device)
+        edge_index, _ = add_self_loops(edge_index, num_nodes=self.num_nodes)
+        self.edge_index = edge_index.to(self.device)
 
     def forward(self):
         x = torch.cat([self.user_embedding.weight, self.item_embedding.weight], dim=0)  # (num_nodes, embedding_dim)
@@ -84,25 +104,37 @@ class PHOENIX(GeneralRecommender):
         item_embeddings = x[self.n_users:]
 
         # Modality feature fusion with attention
-        if self.v_feat is not None and self.t_feat is not None:
-            v_emb = self.v_linear(self.v_feat)
-            t_emb = self.t_linear(self.t_feat)
+        if self.v_feat is not None or self.t_feat is not None:
+            fused_item_embeddings = item_embeddings
+            modality_embeddings = []
+            modality_attentions = []
 
-            # Modality attention
-            v_attn = self.modality_attention(v_emb)
-            t_attn = self.modality_attention(t_emb)
-            attn_weights = F.softmax(torch.cat([v_attn, t_attn], dim=1), dim=1)
+            if self.v_feat is not None and self.v_linear is not None:
+                v_emb = self.v_linear(self.v_feat)
+                modality_embeddings.append(v_emb)
+                if self.modality_attention is not None:
+                    v_attn = self.modality_attention(v_emb)
+                    modality_attentions.append(v_attn)
 
-            fused_item_embeddings = attn_weights[:, 0].unsqueeze(1) * v_emb + attn_weights[:, 1].unsqueeze(1) * t_emb
-            item_embeddings += fused_item_embeddings
+            if self.t_feat is not None and self.t_linear is not None:
+                t_emb = self.t_linear(self.t_feat)
+                modality_embeddings.append(t_emb)
+                if self.modality_attention is not None:
+                    t_attn = self.modality_attention(t_emb)
+                    modality_attentions.append(t_attn)
 
-        elif self.v_feat is not None:
-            v_emb = self.v_linear(self.v_feat)
-            item_embeddings += v_emb
+            if self.modality_attention is not None and len(modality_attentions) > 0:
+                attn_weights = F.softmax(torch.cat(modality_attentions, dim=1), dim=1)
+                fused_modality_emb = sum(
+                    weight.unsqueeze(1) * emb
+                    for weight, emb in zip(attn_weights.t(), modality_embeddings)
+                )
+                fused_item_embeddings += fused_modality_emb
+            else:
+                fused_modality_emb = sum(modality_embeddings)
+                fused_item_embeddings += fused_modality_emb
 
-        elif self.t_feat is not None:
-            t_emb = self.t_linear(self.t_feat)
-            item_embeddings += t_emb
+            item_embeddings = fused_item_embeddings
 
         return user_embeddings, item_embeddings
 
@@ -128,11 +160,19 @@ class PHOENIX(GeneralRecommender):
         u_emb_view1 = F.dropout(u_emb, p=self.dropout_rate, training=True)
         u_emb_view2 = F.dropout(u_emb, p=self.dropout_rate, training=True)
 
-        pos_cosine = F.cosine_similarity(u_emb_view1, u_emb_view2)
-        neg_cosine = torch.matmul(u_emb_view1, u_emb_view2.T)
+        # Normalize embeddings
+        u_emb_view1 = F.normalize(u_emb_view1, dim=1)
+        u_emb_view2 = F.normalize(u_emb_view2, dim=1)
+
+        pos_sim = torch.sum(u_emb_view1 * u_emb_view2, dim=1)
+        pos_sim = pos_sim / self.dropout_rate  # Adjust for dropout
+
+        # Contrastive loss computation
+        logits = torch.matmul(u_emb_view1, u_emb_view2.T)
+        logits /= self.dropout_rate
 
         labels = torch.arange(u_emb.size(0)).to(self.device)
-        contrastive_loss = self.contrastive_loss(neg_cosine, labels)
+        contrastive_loss = self.contrastive_loss(logits, labels)
 
         total_loss = bpr_loss + self.alpha * contrastive_loss
 
