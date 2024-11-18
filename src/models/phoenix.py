@@ -14,8 +14,6 @@ import torch.nn.functional as F
 from common.abstract_recommender import GeneralRecommender
 from torch_geometric.nn import GATConv
 from torch_geometric.utils import add_self_loops, remove_self_loops, to_undirected
-from torch_geometric.data import Data
-from torch_geometric.utils import dense_to_sparse
 
 
 class PHOENIX(GeneralRecommender):
@@ -38,8 +36,8 @@ class PHOENIX(GeneralRecommender):
         self.device = config['device']
 
         # Embedding layers
-        self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
-        self.item_embedding = nn.Embedding(self.n_items, self.embedding_dim)
+        self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim).to(self.device)
+        self.item_embedding = nn.Embedding(self.n_items, self.embedding_dim).to(self.device)
         nn.init.xavier_uniform_(self.user_embedding.weight)
         nn.init.xavier_uniform_(self.item_embedding.weight)
 
@@ -48,14 +46,15 @@ class PHOENIX(GeneralRecommender):
         self.t_feat_embed = None
 
         if self.v_feat is not None:
-            self.v_linear = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
-            nn.init.xavier_uniform_(self.v_linear.weight)
-            self.v_feat_embed = self.v_linear(self.v_feat).to(self.device)
-
+            self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False).to(self.device)
+            self.image_trs = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim).to(self.device)
+            nn.init.xavier_normal_(self.image_trs.weight)
+            self.v_feat_embed = self.image_trs(self.image_embedding.weight)
         if self.t_feat is not None:
-            self.t_linear = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
-            nn.init.xavier_uniform_(self.t_linear.weight)
-            self.t_feat_embed = self.t_linear(self.t_feat).to(self.device)
+            self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False).to(self.device)
+            self.text_trs = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim).to(self.device)
+            nn.init.xavier_normal_(self.text_trs.weight)
+            self.t_feat_embed = self.text_trs(self.text_embedding.weight)
 
         # Heterogeneous Graph Attention Networks for each modality
         self.gat_layers = nn.ModuleList()
@@ -68,12 +67,15 @@ class PHOENIX(GeneralRecommender):
                     concat=False,
                     dropout=self.dropout_rate,
                     negative_slope=self.alpha,
-                )
+                ).to(self.device)
             )
 
         # Modality attention fusion layer
-        self.modality_attention = nn.Linear(self.embedding_dim * 2, self.embedding_dim)
-        nn.init.xavier_uniform_(self.modality_attention.weight)
+        if self.v_feat_embed is not None and self.t_feat_embed is not None:
+            self.modality_attention = nn.Linear(self.feat_embed_dim * 2, self.embedding_dim).to(self.device)
+            nn.init.xavier_uniform_(self.modality_attention.weight)
+        else:
+            self.modality_attention = None
 
         # Loss function
         self.bce_loss = nn.BCEWithLogitsLoss()
@@ -113,16 +115,16 @@ class PHOENIX(GeneralRecommender):
         # Combine edge indices
         edge_index = torch.cat([edge_index_ui, edge_index_ui.flip([0]), edge_index_ii], dim=1)
         edge_index = to_undirected(edge_index)
-
         # Remove self-loops
         edge_index, _ = remove_self_loops(edge_index)
         edge_index = add_self_loops(edge_index, num_nodes=self.n_users + self.n_items)[0]
 
-        self.edge_index = edge_index
+        self.edge_index = edge_index.to(self.device)
 
     def forward(self):
         # Generate node embeddings
         x = torch.cat([self.user_embedding.weight, self.item_embedding.weight], dim=0)
+        x = x.to(self.device)
         all_embeddings = [x]
 
         for gat_layer in self.gat_layers:
@@ -135,7 +137,7 @@ class PHOENIX(GeneralRecommender):
         user_embeddings, item_embeddings = x[:self.n_users], x[self.n_users:]
 
         # Modality-specific item embeddings
-        if self.v_feat_embed is not None and self.t_feat_embed is not None:
+        if self.v_feat_embed is not None and self.t_feat_embed is not None and self.modality_attention is not None:
             modality_embeddings = torch.cat([self.v_feat_embed, self.t_feat_embed], dim=1)
             modality_embeddings = self.modality_attention(modality_embeddings)
             item_embeddings = item_embeddings + modality_embeddings
@@ -149,9 +151,9 @@ class PHOENIX(GeneralRecommender):
         return user_embeddings, item_embeddings
 
     def calculate_loss(self, interaction):
-        users = interaction[0]
-        pos_items = interaction[1]
-        neg_items = interaction[2]
+        users = interaction[0].to(self.device)
+        pos_items = interaction[1].to(self.device)
+        neg_items = interaction[2].to(self.device)
 
         user_embeddings, item_embeddings = self.forward()
         u_embeddings = user_embeddings[users]
@@ -215,7 +217,7 @@ class PHOENIX(GeneralRecommender):
         return loss
 
     def full_sort_predict(self, interaction):
-        users = interaction[0]
+        users = interaction[0].to(self.device)
 
         user_embeddings, item_embeddings = self.forward()
         u_embeddings = user_embeddings[users]
