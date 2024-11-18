@@ -1,150 +1,150 @@
 # coding: utf-8
-# Phoenix Model for Multimodal Recommendation
-
-import os
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn.conv import MessagePassing
-from torch_geometric.utils import remove_self_loops, add_self_loops, degree
+import numpy as np
+import scipy.sparse as sp
+from torch_geometric.nn import GATConv
+from torch_geometric.utils import add_self_loops, remove_self_loops
+
 from common.abstract_recommender import GeneralRecommender
+
 
 class PHOENIX(GeneralRecommender):
     def __init__(self, config, dataset):
         super(PHOENIX, self).__init__(config, dataset)
 
-        # Configuration and parameters
-        self.embedding_dim = config["embedding_size"]
-        self.feat_embed_dim = config["feat_embed_dim"]
-        self.n_layers = config["n_mm_layers"]
-        self.knn_k = config["knn_k"]
-        self.reg_weight = config["reg_weight"]
-        self.dropout = config["dropout"]
-        self.device = config["device"]
+        # Hyperparameters
+        self.embedding_dim = config['embedding_size']
+        self.feat_embed_dim = config['feat_embed_dim']
+        self.n_layers = config['n_layers']
+        self.alpha = config['alpha']  # Contrastive loss weight
+        self.dropout_rate = config['dropout_rate']
+        self.num_heads = config['num_heads']  # For multi-head attention
 
-        # User and Item Embeddings
+        # Build unified graph
+        self.build_unified_graph(dataset)
+
+        # Embeddings
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
         self.item_embedding = nn.Embedding(self.n_items, self.embedding_dim)
+
         nn.init.xavier_uniform_(self.user_embedding.weight)
         nn.init.xavier_uniform_(self.item_embedding.weight)
 
-        # Visual and Textual Feature Embeddings
+        # Feature transformations
         if self.v_feat is not None:
-            self.visual_transform = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
-        if self.t_feat is not None:
-            self.textual_transform = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
+            self.v_feat = F.normalize(self.v_feat, dim=1)
+            self.v_linear = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
+            nn.init.xavier_uniform_(self.v_linear.weight)
 
-        # Graph Convolution Layers
-        self.graph_convs = nn.ModuleList()
+        if self.t_feat is not None:
+            self.t_feat = F.normalize(self.t_feat, dim=1)
+            self.t_linear = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
+            nn.init.xavier_uniform_(self.t_linear.weight)
+
+        # Attention-based GNN layers
+        self.gnn_layers = nn.ModuleList()
         for _ in range(self.n_layers):
-            self.graph_convs.append(GraphConvolution(self.embedding_dim, self.embedding_dim))
+            self.gnn_layers.append(GATConv(self.embedding_dim, self.embedding_dim, heads=self.num_heads, dropout=self.dropout_rate))
 
-        # Multimodal Graph Construction
-        self.mm_adj = self.build_multimodal_graph(dataset)
+        # Modality attention
+        self.modality_attention = nn.Linear(self.feat_embed_dim, 1)
 
-    def build_multimodal_graph(self, dataset):
-        # Build adjacency matrix using both visual and textual features
-        adj_matrix = torch.eye(self.n_users + self.n_items).to(self.device)
-        if self.v_feat is not None:
-            adj_matrix += self.build_knn_graph(self.v_feat, topk=self.knn_k)
-        if self.t_feat is not None:
-            adj_matrix += self.build_knn_graph(self.t_feat, topk=self.knn_k)
-        return adj_matrix
+        # Loss functions
+        self.bce_loss = nn.BCEWithLogitsLoss()
+        self.contrastive_loss = nn.CrossEntropyLoss()
 
-    def build_knn_graph(self, features, topk):
-        context_norm = features.div(torch.norm(features, p=2, dim=-1, keepdim=True))
-        sim = torch.mm(context_norm, context_norm.transpose(1, 0))
-        _, knn_indices = torch.topk(sim, topk, dim=-1)
-        adj_size = sim.size()
-        del sim
+        # Device
+        self.device = config['device']
 
-        indices0 = torch.arange(knn_indices.shape[0]).to(self.device)
-        indices0 = indices0.unsqueeze(1).expand(-1, topk)
-        indices = torch.stack((indices0.flatten(), knn_indices.flatten()), 0)
-        return torch.sparse_coo_tensor(indices, torch.ones_like(indices[0]), adj_size)
+    def build_unified_graph(self, dataset):
+        # Build user-item interaction graph
+        user_item_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
+        self.num_nodes = self.n_users + self.n_items
+
+        # Edges
+        user_item_edges = np.vstack((user_item_matrix.row, user_item_matrix.col + self.n_users))
+        item_user_edges = np.vstack((user_item_matrix.col + self.n_users, user_item_matrix.row))
+        self.edge_index = np.hstack((user_item_edges, item_user_edges))
+
+        # Add self-loops
+        self.edge_index, _ = add_self_loops(torch.tensor(self.edge_index, dtype=torch.long), num_nodes=self.num_nodes)
+        self.edge_index = self.edge_index.to(self.device)
 
     def forward(self):
-        # Base User and Item Embeddings
-        user_emb = self.user_embedding.weight
-        item_emb = self.item_embedding.weight
+        x = torch.cat([self.user_embedding.weight, self.item_embedding.weight], dim=0)  # (num_nodes, embedding_dim)
 
-        # Process Visual and Textual Features
-        visual_emb, textual_emb = 0, 0
-        if self.v_feat is not None:
-            visual_emb = F.relu(self.visual_transform(self.v_feat))
-        if self.t_feat is not None:
-            textual_emb = F.relu(self.textual_transform(self.t_feat))
+        # Apply GNN layers with attention
+        for gnn in self.gnn_layers:
+            x = gnn(x, self.edge_index)
+            x = F.elu(x)
+            x = F.dropout(x, p=self.dropout_rate, training=self.training)
 
-        # Enhanced Item Embedding with Visual and Textual Information
-        item_emb = item_emb + visual_emb + textual_emb
+        # Split embeddings back into users and items
+        user_embeddings = x[:self.n_users]
+        item_embeddings = x[self.n_users:]
 
-        # Concatenate User and Item Embeddings for GCN
-        all_emb = torch.cat((user_emb, item_emb), dim=0)
+        # Modality feature fusion with attention
+        if self.v_feat is not None and self.t_feat is not None:
+            v_emb = self.v_linear(self.v_feat)
+            t_emb = self.t_linear(self.t_feat)
 
-        # Graph Convolution Layers
-        for conv in self.graph_convs:
-            all_emb = F.relu(conv(all_emb, self.mm_adj))
+            # Modality attention
+            v_attn = self.modality_attention(v_emb)
+            t_attn = self.modality_attention(t_emb)
+            attn_weights = F.softmax(torch.cat([v_attn, t_attn], dim=1), dim=1)
 
-        # Separate User and Item Embeddings
-        user_emb, item_emb = torch.split(all_emb, [self.n_users, self.n_items], dim=0)
-        return user_emb, item_emb
+            fused_item_embeddings = attn_weights[:, 0].unsqueeze(1) * v_emb + attn_weights[:, 1].unsqueeze(1) * t_emb
+            item_embeddings += fused_item_embeddings
+
+        elif self.v_feat is not None:
+            v_emb = self.v_linear(self.v_feat)
+            item_embeddings += v_emb
+
+        elif self.t_feat is not None:
+            t_emb = self.t_linear(self.t_feat)
+            item_embeddings += t_emb
+
+        return user_embeddings, item_embeddings
 
     def calculate_loss(self, interaction):
-        users, pos_items, neg_items = interaction
+        user = interaction[0]
+        pos_item = interaction[1]
+        neg_item = interaction[2]
 
-        # Forward Pass to Get Embeddings
-        user_emb, item_emb = self.forward()
+        user_embeddings, item_embeddings = self.forward()
 
-        # Extract Embeddings for Current Batch
-        u_emb = user_emb[users]
-        pos_i_emb = item_emb[pos_items]
-        neg_i_emb = item_emb[neg_items]
+        u_emb = user_embeddings[user]
+        pos_i_emb = item_embeddings[pos_item]
+        neg_i_emb = item_embeddings[neg_item]
 
-        # Calculate BPR Loss
+        # BPR Loss
         pos_scores = torch.sum(u_emb * pos_i_emb, dim=1)
         neg_scores = torch.sum(u_emb * neg_i_emb, dim=1)
         bpr_loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
 
-        # Add Regularization Loss
-        reg_loss = self.reg_weight * (
-            torch.norm(u_emb) ** 2 + torch.norm(pos_i_emb) ** 2 + torch.norm(neg_i_emb) ** 2
-        )
+        # Contrastive Loss
+        # Generate positive and negative pairs for contrastive learning
+        # For simplicity, we use embeddings before and after dropout as positive pairs
+        u_emb_view1 = F.dropout(u_emb, p=self.dropout_rate, training=True)
+        u_emb_view2 = F.dropout(u_emb, p=self.dropout_rate, training=True)
 
-        return bpr_loss + reg_loss
+        pos_cosine = F.cosine_similarity(u_emb_view1, u_emb_view2)
+        neg_cosine = torch.matmul(u_emb_view1, u_emb_view2.T)
+
+        labels = torch.arange(u_emb.size(0)).to(self.device)
+        contrastive_loss = self.contrastive_loss(neg_cosine, labels)
+
+        total_loss = bpr_loss + self.alpha * contrastive_loss
+
+        return total_loss
 
     def full_sort_predict(self, interaction):
-        users = interaction
+        user = interaction[0]
+        user_embeddings, item_embeddings = self.forward()
+        u_emb = user_embeddings[user]
 
-        # Forward Pass to Get Embeddings
-        user_emb, item_emb = self.forward()
-
-        # Get Embeddings for the Queried Users
-        user_emb = user_emb[users]
-
-        # Compute Scores for All Items
-        scores = torch.matmul(user_emb, item_emb.t())
+        scores = torch.matmul(u_emb, item_embeddings.T)
         return scores
 
-
-class GraphConvolution(MessagePassing):
-    def __init__(self, in_channels, out_channels, aggr='add'):
-        super(GraphConvolution, self).__init__(aggr=aggr)
-        self.linear = nn.Linear(in_channels, out_channels)
-        self.aggr = aggr
-
-    def forward(self, x, edge_index):
-        edge_index, _ = remove_self_loops(edge_index)
-        edge_index, _ = add_self_loops(edge_index, num_nodes=x.size(0))
-        x = self.linear(x)
-        return self.propagate(edge_index, x=x)
-
-    def message(self, x_j, edge_index, size):
-        row, col = edge_index
-        deg = degree(row, size[0], dtype=x_j.dtype)
-        deg_inv_sqrt = deg.pow(-0.5)
-        norm = deg_inv_sqrt[row] * deg_inv_sqrt[col]
-        return norm.view(-1, 1) * x_j
-
-    def update(self, aggr_out):
-        return aggr_out
