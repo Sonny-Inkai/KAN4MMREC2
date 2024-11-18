@@ -11,3 +11,5 @@ ssl_weight: 0.1             # Weight for self-supervised loss
 ssl_temp: 0.5               # Temperature for contrastive loss
 ssl_dropout: 0.1            # Dropout for augmenting embeddings
 hyper_parameters: ["dropout", "reg_weight"]
+tau: 0.1
+weight_decay: 1e-5
