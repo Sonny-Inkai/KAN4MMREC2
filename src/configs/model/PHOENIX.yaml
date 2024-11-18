@@ -1,5 +1,5 @@
 embedding_size: 64          # Dimension of embeddings
-feat_embed_size: 64         # Dimension of modality feature embeddings
+feat_embed_dim: 64         # Dimension of modality feature embeddings
 num_layers: 2               # Number of GAT layers
 num_heads: 4                # Number of attention heads in GAT
 dropout_rate: 0.2           # Dropout rate
