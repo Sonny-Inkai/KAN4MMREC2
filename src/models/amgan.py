@@ -63,7 +63,8 @@ class AMGAN(GeneralRecommender):
                              [1] * inter_M.nnz))
         data_dict.update(dict(zip(zip(inter_M_t.row + self.n_users, inter_M_t.col),
                                   [1] * inter_M_t.nnz)))
-        A = A + sp.dok_matrix(data_dict)  # Use addition to update DOK matrix
+        for key, value in data_dict.items():
+            A[key] = value
         # norm adj matrix
         sumArr = (A > 0).sum(axis=1)
         # add epsilon to avoid Divide by zero Warning
