@@ -3,7 +3,7 @@
 # Updated by enoche
 # Paper: Self-supervised Learning for Multimedia Recommendation
 # Github: https://github.com/zltao/SLMRec
-# Enhanced: AMGAN++ (with Graph-Freezing, Bootstrap, Self-Attention, Cross-Attention Fusion)
+# Enhanced: AMGAN++ (with Graph-Freezing, Bootstrap, Self-Attention, Cross-Attention Fusion, Improved Regularization, and Skip Connections)
 
 import os
 import copy
@@ -55,7 +55,11 @@ class AMGAN(GeneralRecommender):
             nn.init.xavier_normal_(self.text_trs.weight)
 
         # Self-Attention Layers for Graph Information
-        self.attention_layer = GATConv(self.embedding_dim, self.embedding_dim // 2, heads=2, concat=True)
+        self.attention_layer = GATConv(self.embedding_dim, self.embedding_dim, heads=2, concat=False)
+
+        # Adding Layer Normalization and Dropout for stability and regularization
+        self.layer_norm = nn.LayerNorm(self.embedding_dim)
+        self.dropout_layer = nn.Dropout(self.dropout)
 
     def get_norm_adj_mat(self, interaction_matrix):
         A = sp.dok_matrix((self.n_users + self.n_items,
@@ -87,11 +91,14 @@ class AMGAN(GeneralRecommender):
     def forward(self):
         h = self.item_id_embedding.weight
 
-        # Apply GAT for self-attention enhanced aggregation
+        # Apply GAT for self-attention enhanced aggregation with skip connections
         ego_embeddings = torch.cat((self.user_embedding.weight, self.item_id_embedding.weight), dim=0)
         all_embeddings = [ego_embeddings]
         for i in range(self.n_layers):
-            ego_embeddings = self.attention_layer(ego_embeddings, self.norm_adj.coalesce().indices())
+            attention_output = self.attention_layer(ego_embeddings, self.norm_adj.coalesce().indices())
+            attention_output = self.layer_norm(attention_output)  # Layer Normalization
+            attention_output = self.dropout_layer(attention_output)  # Dropout for regularization
+            ego_embeddings = ego_embeddings + attention_output  # Skip connection
             all_embeddings += [ego_embeddings]
         all_embeddings = torch.stack(all_embeddings, dim=1)
         all_embeddings = all_embeddings.mean(dim=1, keepdim=False)
