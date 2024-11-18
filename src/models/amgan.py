@@ -43,13 +43,13 @@ class AMGAN(GeneralRecommender):
         nn.init.xavier_uniform_(self.item_id_embedding.weight)
 
         # Multimodal feature layers
-        if self.v_feat is not None:
+        if hasattr(self, 'v_feat') and self.v_feat is not None:
             self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
-            self.image_trs = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
+            self.image_trs = nn.Linear(self.v_feat.size(1), self.feat_embed_dim)
             nn.init.xavier_normal_(self.image_trs.weight)
-        if self.t_feat is not None:
+        if hasattr(self, 't_feat') and self.t_feat is not None:
             self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
-            self.text_trs = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
+            self.text_trs = nn.Linear(self.t_feat.size(1), self.feat_embed_dim)
             nn.init.xavier_normal_(self.text_trs.weight)
 
         # Graph Attention Network for enhancing graph representation learning
@@ -103,9 +103,9 @@ class AMGAN(GeneralRecommender):
         # Online network forward pass
         u_online_ori, i_online_ori = self.forward()
         t_feat_online, v_feat_online = None, None
-        if self.t_feat is not None:
+        if hasattr(self, 't_feat') and self.t_feat is not None:
             t_feat_online = self.text_trs(self.text_embedding.weight)
-        if self.v_feat is not None:
+        if hasattr(self, 'v_feat') and self.v_feat is not None:
             v_feat_online = self.image_trs(self.image_embedding.weight)
 
         # Target embeddings for contrastive learning
@@ -114,11 +114,11 @@ class AMGAN(GeneralRecommender):
             u_target = F.dropout(u_target, self.dropout)
             i_target = F.dropout(i_target, self.dropout)
 
-            if self.t_feat is not None:
+            if hasattr(self, 't_feat') and self.t_feat is not None:
                 t_feat_target = t_feat_online.clone()
                 t_feat_target = F.dropout(t_feat_target, self.dropout)
 
-            if self.v_feat is not None:
+            if hasattr(self, 'v_feat') and self.v_feat is not None:
                 v_feat_target = v_feat_online.clone()
                 v_feat_target = F.dropout(v_feat_target, self.dropout)
 
@@ -132,13 +132,13 @@ class AMGAN(GeneralRecommender):
 
         # Contrastive learning losses
         loss_t, loss_v, loss_tv, loss_vt = 0.0, 0.0, 0.0, 0.0
-        if self.t_feat is not None:
+        if hasattr(self, 't_feat') and self.t_feat is not None:
             t_feat_online = self.predictor(t_feat_online)
             t_feat_online = t_feat_online[items, :]
             t_feat_target = t_feat_target[items, :]
             loss_t = 1 - cosine_similarity(t_feat_online, i_target.detach(), dim=-1).mean()
             loss_tv = 1 - cosine_similarity(t_feat_online, t_feat_target.detach(), dim=-1).mean()
-        if self.v_feat is not None:
+        if hasattr(self, 'v_feat') and self.v_feat is not None:
             v_feat_online = self.predictor(v_feat_online)
             v_feat_online = v_feat_online[items, :]
             v_feat_target = v_feat_target[items, :]
