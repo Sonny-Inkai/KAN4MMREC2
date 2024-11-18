@@ -10,12 +10,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import scipy.sparse as sp
 
 from common.abstract_recommender import GeneralRecommender
 from torch_geometric.nn import GCNConv
-from torch_geometric.data import Data
-from torch_geometric.utils import add_self_loops, degree
 
 class PHOENIX(GeneralRecommender):
     def __init__(self, config, dataset):
@@ -26,7 +23,7 @@ class PHOENIX(GeneralRecommender):
         self.feat_embed_dim = config['feat_embed_dim']
         self.n_layers = config['n_layers']
         self.dropout = config['dropout']
-        self.alpha = config['alpha']  # For balancing losses
+        self.alpha = config['alpha']
 
         self.n_users = self.n_users
         self.n_items = self.n_items
@@ -39,12 +36,14 @@ class PHOENIX(GeneralRecommender):
 
         # Initialize Modality-specific Embeddings
         if self.v_feat is not None:
-            self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
-            self.v_transform = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
+            self.v_feat = F.normalize(self.v_feat, dim=1)
+            in_dim = self.v_feat.shape[1]
+            self.v_transform = nn.Linear(in_dim, self.feat_embed_dim)
             nn.init.xavier_uniform_(self.v_transform.weight)
         if self.t_feat is not None:
-            self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
-            self.t_transform = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
+            self.t_feat = F.normalize(self.t_feat, dim=1)
+            in_dim = self.t_feat.shape[1]
+            self.t_transform = nn.Linear(in_dim, self.feat_embed_dim)
             nn.init.xavier_uniform_(self.t_transform.weight)
 
         # GCN Layers for User-Item Graph
@@ -68,8 +67,12 @@ class PHOENIX(GeneralRecommender):
         self.attention_layer = nn.Linear(total_feat_dim, 1)
         nn.init.xavier_uniform_(self.attention_layer.weight)
 
+        # Projection layer to match dimensions
+        self.item_proj = nn.Linear(total_feat_dim, self.embedding_dim)
+        nn.init.xavier_uniform_(self.item_proj.weight)
+
         # Contrastive Loss Function
-        self.ssl_criterion = nn.BCEWithLogitsLoss()
+        self.ssl_criterion = nn.CrossEntropyLoss()
 
         # Build Graphs
         self.build_graph(dataset)
@@ -79,7 +82,6 @@ class PHOENIX(GeneralRecommender):
         interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
         user_np = interaction_matrix.row
         item_np = interaction_matrix.col + self.n_users  # Offset item indices
-        ratings = interaction_matrix.data
         edge_index = np.array([np.concatenate([user_np, item_np]),
                                np.concatenate([item_np, user_np])])
         edge_index = torch.tensor(edge_index, dtype=torch.long).to(self.device)
@@ -108,10 +110,8 @@ class PHOENIX(GeneralRecommender):
         row_indices = torch.arange(self.item_num, device=self.device).unsqueeze(1).expand(-1, k).flatten()
         col_indices = knn_indices.flatten()
         edge_index = torch.stack([row_indices, col_indices], dim=0)
-        # Ensure edge_index is on the correct device (optional)
-        edge_index = edge_index.to(self.device)
+        # No need to move edge_index to device again since tensors are already on the correct device
         return edge_index
-
 
     def forward(self):
         # User-Item Graph Embedding Propagation
@@ -127,7 +127,7 @@ class PHOENIX(GeneralRecommender):
         # Modality-specific Item Embeddings
         modality_embeddings = []
         if self.v_feat is not None:
-            v_emb = self.v_transform(self.image_embedding.weight)
+            v_emb = self.v_transform(self.v_feat)
             for gcn in self.v_gcn_layers:
                 v_emb = gcn(v_emb, self.v_edge_index)
                 v_emb = F.relu(v_emb)
@@ -135,7 +135,7 @@ class PHOENIX(GeneralRecommender):
             modality_embeddings.append(v_emb)
 
         if self.t_feat is not None:
-            t_emb = self.t_transform(self.text_embedding.weight)
+            t_emb = self.t_transform(self.t_feat)
             for gcn in self.t_gcn_layers:
                 t_emb = gcn(t_emb, self.t_edge_index)
                 t_emb = F.relu(t_emb)
@@ -152,6 +152,9 @@ class PHOENIX(GeneralRecommender):
         attention_scores = self.attention_layer(item_all_emb)
         attention_weights = torch.sigmoid(attention_scores)
         item_final_emb = item_all_emb * attention_weights
+
+        # Project item embeddings back to embedding_dim
+        item_final_emb = self.item_proj(item_final_emb)
 
         # Return final embeddings
         return user_gcn_emb, item_final_emb
@@ -190,9 +193,11 @@ class PHOENIX(GeneralRecommender):
             t_emb = self.t_transform(self.t_feat)
             v_emb = F.normalize(v_emb, dim=1)
             t_emb = F.normalize(t_emb, dim=1)
-            logits = torch.mm(v_emb, t_emb.t())
+            # Create labels for contrastive loss
             labels = torch.arange(self.n_items).to(self.device)
-            contrastive_loss = F.cross_entropy(logits, labels)
+            # Compute logits
+            logits = torch.matmul(v_emb, t_emb.t()) / 0.1  # Temperature parameter
+            contrastive_loss = self.ssl_criterion(logits, labels)
             losses.append(contrastive_loss)
         if losses:
             return sum(losses) / len(losses)
@@ -205,4 +210,3 @@ class PHOENIX(GeneralRecommender):
         user_emb = user_gcn_emb[user]
         scores = torch.matmul(user_emb, item_final_emb.t())
         return scores
-
