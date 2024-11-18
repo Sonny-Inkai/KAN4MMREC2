@@ -1,188 +1,113 @@
-# coding: utf-8
+# phoenix.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-import scipy.sparse as sp
-from torch_geometric.nn import GATConv
-from torch_geometric.utils import add_self_loops
-
+from torch_geometric.nn import GATConv, MessagePassing
 from common.abstract_recommender import GeneralRecommender
-
 
 class PHOENIX(GeneralRecommender):
     def __init__(self, config, dataset):
         super(PHOENIX, self).__init__(config, dataset)
-
-        # Hyperparameters
-        self.embedding_dim = config['embedding_size']
-        self.feat_embed_dim = config['feat_embed_dim']
-        self.n_layers = config['n_layers']
-        self.alpha = config['alpha']  # Contrastive loss weight
-        self.dropout_rate = config['dropout_rate']
-        self.num_heads = config['num_heads']  # For multi-head attention
-
-        # Build unified graph
-        self.build_unified_graph(dataset)
-
+        
+        # Model Configurations
+        self.embedding_dim = config["embedding_size"]
+        self.n_layers = config["n_gnn_layers"]
+        self.knn_k = config["knn_k"]
+        self.reg_weight = config["reg_weight"]
+        self.cl_weight = config["cl_weight"]
+        self.device = config["device"]
+        
         # Embeddings
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
         self.item_embedding = nn.Embedding(self.n_items, self.embedding_dim)
-
         nn.init.xavier_uniform_(self.user_embedding.weight)
         nn.init.xavier_uniform_(self.item_embedding.weight)
 
-        # Feature transformations
+        # Modality-Specific Transformation Layers
         if self.v_feat is not None:
-            self.v_feat = F.normalize(self.v_feat, dim=1)
-            self.v_linear = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
-            nn.init.xavier_uniform_(self.v_linear.weight)
-        else:
-            self.v_linear = None
-
+            self.image_transform = nn.Linear(self.v_feat.shape[1], self.embedding_dim)
         if self.t_feat is not None:
-            self.t_feat = F.normalize(self.t_feat, dim=1)
-            self.t_linear = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
-            nn.init.xavier_uniform_(self.t_linear.weight)
-        else:
-            self.t_linear = None
+            self.text_transform = nn.Linear(self.t_feat.shape[1], self.embedding_dim)
+        
+        # Attention Layers
+        self.graph_attention = GATConv(self.embedding_dim, self.embedding_dim, heads=1, concat=False)
+        self.modality_attention = nn.Linear(3 * self.embedding_dim, self.embedding_dim)
 
-        # Attention-based GNN layers
-        self.gnn_layers = nn.ModuleList()
-        for _ in range(self.n_layers):
-            self.gnn_layers.append(
-                GATConv(
-                    self.embedding_dim,
-                    self.embedding_dim,
-                    heads=self.num_heads,
-                    dropout=self.dropout_rate,
-                    concat=False  # Set concat=False to keep the output dimension consistent
-                )
-            )
+        # Projection Layers for Contrastive Learning
+        self.user_projection = nn.Linear(self.embedding_dim, self.embedding_dim)
+        self.item_projection = nn.Linear(self.embedding_dim, self.embedding_dim)
 
-        # Modality attention
-        if self.v_feat is not None and self.t_feat is not None:
-            self.modality_attention = nn.Linear(self.feat_embed_dim, 1)
-        else:
-            self.modality_attention = None
+        # Fusion Layer
+        self.fusion_layer = nn.Linear(3 * self.embedding_dim, self.embedding_dim)
 
-        # Loss functions
-        self.bce_loss = nn.BCEWithLogitsLoss()
-        self.contrastive_loss = nn.CrossEntropyLoss()
-
-        # Device
-        self.device = config['device']
-
-    def build_unified_graph(self, dataset):
-        # Build user-item interaction graph
-        user_item_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
-        self.num_nodes = self.n_users + self.n_items
-
-        # Edges
-        user_item_edges = np.vstack((user_item_matrix.row, user_item_matrix.col + self.n_users))
-        item_user_edges = np.vstack((user_item_matrix.col + self.n_users, user_item_matrix.row))
-        edge_index = np.hstack((user_item_edges, item_user_edges))
-
-        # Convert to tensor
-        edge_index = torch.tensor(edge_index, dtype=torch.long)
-
-        # Add self-loops
-        edge_index, _ = add_self_loops(edge_index, num_nodes=self.num_nodes)
-        self.edge_index = edge_index.to(self.device)
+        # Loss Functions
+        self.bpr_loss = nn.BCEWithLogitsLoss()
+        self.cl_loss = nn.CosineEmbeddingLoss()
 
     def forward(self):
-        x = torch.cat([self.user_embedding.weight, self.item_embedding.weight], dim=0)  # (num_nodes, embedding_dim)
+        # User and Item Embeddings
+        user_embeddings = self.user_embedding.weight
+        item_embeddings = self.item_embedding.weight
 
-        # Apply GNN layers with attention
-        for gnn in self.gnn_layers:
-            x = gnn(x, self.edge_index)
-            x = F.elu(x)
-            x = F.dropout(x, p=self.dropout_rate, training=self.training)
+        # Visual and Textual Feature Embeddings
+        if self.v_feat is not None:
+            v_embeddings = F.normalize(self.image_transform(self.v_feat), dim=1)
+        else:
+            v_embeddings = torch.zeros_like(item_embeddings).to(self.device)
+        if self.t_feat is not None:
+            t_embeddings = F.normalize(self.text_transform(self.t_feat), dim=1)
+        else:
+            t_embeddings = torch.zeros_like(item_embeddings).to(self.device)
 
-        # Split embeddings back into users and items
-        user_embeddings = x[:self.n_users]
-        item_embeddings = x[self.n_users:]
+        # Multi-Hop Graph Attention
+        all_embeddings = torch.cat((user_embeddings, item_embeddings), dim=0)
+        for _ in range(self.n_layers):
+            all_embeddings = F.dropout(all_embeddings, p=0.1, training=self.training)
+            all_embeddings = self.graph_attention(all_embeddings, self.edge_index)
 
-        # Modality feature fusion with attention
-        if self.v_feat is not None or self.t_feat is not None:
-            fused_item_embeddings = item_embeddings
-            modality_embeddings = []
-            modality_attentions = []
+        user_embeddings, item_embeddings = torch.split(
+            all_embeddings, [self.n_users, self.n_items], dim=0
+        )
 
-            if self.v_feat is not None and self.v_linear is not None:
-                v_emb = self.v_linear(self.v_feat)
-                modality_embeddings.append(v_emb)
-                if self.modality_attention is not None:
-                    v_attn = self.modality_attention(v_emb)
-                    modality_attentions.append(v_attn)
+        # Modality Fusion with Attention
+        combined_item_embeddings = torch.cat(
+            [item_embeddings, v_embeddings, t_embeddings], dim=1
+        )
+        fused_item_embeddings = F.relu(self.modality_attention(combined_item_embeddings))
 
-            if self.t_feat is not None and self.t_linear is not None:
-                t_emb = self.t_linear(self.t_feat)
-                modality_embeddings.append(t_emb)
-                if self.modality_attention is not None:
-                    t_attn = self.modality_attention(t_emb)
-                    modality_attentions.append(t_attn)
-
-            if self.modality_attention is not None and len(modality_attentions) > 0:
-                attn_weights = F.softmax(torch.cat(modality_attentions, dim=1), dim=1)
-                fused_modality_emb = sum(
-                    weight.unsqueeze(1) * emb
-                    for weight, emb in zip(attn_weights.t(), modality_embeddings)
-                )
-                fused_item_embeddings += fused_modality_emb
-            else:
-                fused_modality_emb = sum(modality_embeddings)
-                fused_item_embeddings += fused_modality_emb
-
-            item_embeddings = fused_item_embeddings
-
-        return user_embeddings, item_embeddings
+        # Final User and Item Representations
+        return user_embeddings, fused_item_embeddings
 
     def calculate_loss(self, interaction):
-        user = interaction[0]
-        pos_item = interaction[1]
-        neg_item = interaction[2]
+        # Get User and Item Embeddings
+        user_indices = interaction[0]
+        pos_item_indices = interaction[1]
+        neg_item_indices = interaction[2]
 
         user_embeddings, item_embeddings = self.forward()
-
-        u_emb = user_embeddings[user]
-        pos_i_emb = item_embeddings[pos_item]
-        neg_i_emb = item_embeddings[neg_item]
+        pos_scores = torch.mul(user_embeddings[user_indices], item_embeddings[pos_item_indices]).sum(dim=1)
+        neg_scores = torch.mul(user_embeddings[user_indices], item_embeddings[neg_item_indices]).sum(dim=1)
 
         # BPR Loss
-        pos_scores = torch.sum(u_emb * pos_i_emb, dim=1)
-        neg_scores = torch.sum(u_emb * neg_i_emb, dim=1)
         bpr_loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
 
-        # Contrastive Loss
-        # Generate positive and negative pairs for contrastive learning
-        # For simplicity, we use embeddings before and after dropout as positive pairs
-        u_emb_view1 = F.dropout(u_emb, p=self.dropout_rate, training=True)
-        u_emb_view2 = F.dropout(u_emb, p=self.dropout_rate, training=True)
+        # Contrastive Loss (Optional)
+        if self.cl_weight > 0:
+            pos_cl_loss = self.contrastive_loss(user_embeddings[user_indices], item_embeddings[pos_item_indices])
+            neg_cl_loss = self.contrastive_loss(user_embeddings[user_indices], item_embeddings[neg_item_indices])
+            cl_loss = (pos_cl_loss + neg_cl_loss) / 2
+        else:
+            cl_loss = 0.0
 
-        # Normalize embeddings
-        u_emb_view1 = F.normalize(u_emb_view1, dim=1)
-        u_emb_view2 = F.normalize(u_emb_view2, dim=1)
+        return bpr_loss + self.cl_weight * cl_loss
 
-        pos_sim = torch.sum(u_emb_view1 * u_emb_view2, dim=1)
-        pos_sim = pos_sim / self.dropout_rate  # Adjust for dropout
-
-        # Contrastive loss computation
-        logits = torch.matmul(u_emb_view1, u_emb_view2.T)
-        logits /= self.dropout_rate
-
-        labels = torch.arange(u_emb.size(0)).to(self.device)
-        contrastive_loss = self.contrastive_loss(logits, labels)
-
-        total_loss = bpr_loss + self.alpha * contrastive_loss
-
-        return total_loss
+    def contrastive_loss(self, user_embeddings, item_embeddings):
+        user_proj = F.normalize(self.user_projection(user_embeddings), dim=1)
+        item_proj = F.normalize(self.item_projection(item_embeddings), dim=1)
+        return 1 - F.cosine_similarity(user_proj, item_proj).mean()
 
     def full_sort_predict(self, interaction):
-        user = interaction[0]
+        user_indices = interaction[0]
         user_embeddings, item_embeddings = self.forward()
-        u_emb = user_embeddings[user]
-
-        scores = torch.matmul(u_emb, item_embeddings.T)
+        scores = torch.matmul(user_embeddings[user_indices], item_embeddings.T)
         return scores
-
