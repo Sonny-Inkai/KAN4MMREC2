@@ -1,4 +1,4 @@
-# phoenix_enhanced.py
+# phoenix_ultimate.py
 # coding: utf-8
 
 import torch
@@ -15,7 +15,7 @@ class MultiHeadAttention(nn.Module):
         self.num_heads = num_heads
         self.attention = nn.MultiheadAttention(dim, num_heads)
         self.layer_norm = nn.LayerNorm(dim)
-        
+
     def forward(self, x):
         x = x.unsqueeze(0)
         attn_output, _ = self.attention(x, x, x)
@@ -32,7 +32,6 @@ class PHOENIX(GeneralRecommender):
         self.n_layers = config['n_layers']
         self.dropout = config['dropout']
         self.device = config['device']
-        self.weight_decay = config['weight_decay']
         self.n_users = self.n_users
         self.n_items = self.n_items
 
@@ -42,12 +41,15 @@ class PHOENIX(GeneralRecommender):
         nn.init.xavier_uniform_(self.user_embedding.weight)
         nn.init.xavier_uniform_(self.item_embedding.weight)
 
-        # GCN layers with residual connections
+        # Stacked GCN layers
         self.gcn_layers = nn.ModuleList()
         for _ in range(self.n_layers):
             self.gcn_layers.append(GCNConv(self.embedding_dim, self.embedding_dim).to(self.device))
 
-        # Attention layer for final output
+        # Cross-modal attention
+        self.cross_modal_attention = MultiHeadAttention(self.embedding_dim).to(self.device)
+
+        # Final attention layer
         self.final_attention = MultiHeadAttention(self.embedding_dim).to(self.device)
 
         # Build graph
@@ -67,7 +69,7 @@ class PHOENIX(GeneralRecommender):
 
         x = torch.cat([user_emb, item_emb], dim=0)
 
-        # GCN forward pass
+        # Stacked GCN forward pass
         for layer in self.gcn_layers:
             x_prev = x
             x = layer(x, self.edge_index)
@@ -76,10 +78,13 @@ class PHOENIX(GeneralRecommender):
 
         user_gcn_emb, item_gcn_emb = x[:self.n_users], x[self.n_users:]
 
-        # Final attention layer
-        item_final_emb = self.final_attention(item_gcn_emb)
+        # Cross-modal attention
+        item_combined_emb = self.cross_modal_attention(item_gcn_emb)
 
-        return user_gcn_emb, item_final_emb
+        # Final attention layer
+        final_emb = self.final_attention(item_combined_emb)
+
+        return user_gcn_emb, final_emb
 
     def calculate_loss(self, interaction):
         users = interaction[0].to(self.device)
