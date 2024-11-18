@@ -32,16 +32,14 @@ class PHOENIX(GeneralRecommender):
         nn.init.xavier_uniform_(self.user_embedding.weight)
         nn.init.xavier_uniform_(self.item_embedding.weight)
 
-        # Feature transformations
         if self.v_feat is not None:
-            self.v_feat = F.normalize(self.v_feat, dim=1)
-            self.v_linear = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
-            nn.init.xavier_uniform_(self.v_linear.weight)
-
+            self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
+            self.image_trs = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
+            nn.init.xavier_normal_(self.image_trs.weight)
         if self.t_feat is not None:
-            self.t_feat = F.normalize(self.t_feat, dim=1)
-            self.t_linear = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
-            nn.init.xavier_uniform_(self.t_linear.weight)
+            self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
+            self.text_trs = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
+            nn.init.xavier_normal_(self.text_trs.weight)
 
         # Attention-based GNN layers
         self.gnn_layers = nn.ModuleList()
