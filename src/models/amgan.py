@@ -18,7 +18,6 @@ from torch_geometric.nn import GATConv
 
 from common.abstract_recommender import GeneralRecommender
 from common.loss import EmbLoss
-from common.attention import CrossAttention  # Assuming CrossAttention is a custom module for cross-attention
 
 class AMGAN(GeneralRecommender):
     def __init__(self, config, dataset):
@@ -57,8 +56,6 @@ class AMGAN(GeneralRecommender):
 
         # Self-Attention Layers for Graph Information
         self.attention_layer = GATConv(self.embedding_dim, self.embedding_dim, heads=2, concat=True)
-        # Cross-Attention Fusion Layer for multimodal features
-        self.cross_attention = CrossAttention(self.feat_embed_dim, self.embedding_dim)
 
     def get_norm_adj_mat(self, interaction_matrix):
         A = sp.dok_matrix((self.n_users + self.n_items,
@@ -137,15 +134,11 @@ class AMGAN(GeneralRecommender):
         # Calculate loss terms
         loss_t, loss_v, loss_tv, loss_vt = 0.0, 0.0, 0.0, 0.0
         if self.t_feat is not None:
-            t_feat_online = self.cross_attention(t_feat_online, i_target)
-            t_feat_target = self.cross_attention(t_feat_target, i_target)
-            loss_t = 1 - cosine_similarity(t_feat_online, i_target.detach(), dim=-1).mean()
-            loss_tv = 1 - cosine_similarity(t_feat_online, t_feat_target.detach(), dim=-1).mean()
+            loss_t = 1 - cosine_similarity(t_feat_online[items, :], i_target.detach(), dim=-1).mean()
+            loss_tv = 1 - cosine_similarity(t_feat_online[items, :], t_feat_target[items, :].detach(), dim=-1).mean()
         if self.v_feat is not None:
-            v_feat_online = self.cross_attention(v_feat_online, i_target)
-            v_feat_target = self.cross_attention(v_feat_target, i_target)
-            loss_v = 1 - cosine_similarity(v_feat_online, i_target.detach(), dim=-1).mean()
-            loss_vt = 1 - cosine_similarity(v_feat_online, v_feat_target.detach(), dim=-1).mean()
+            loss_v = 1 - cosine_similarity(v_feat_online[items, :], i_target.detach(), dim=-1).mean()
+            loss_vt = 1 - cosine_similarity(v_feat_online[items, :], v_feat_target[items, :].detach(), dim=-1).mean()
 
         loss_ui = 1 - cosine_similarity(u_online, i_target.detach(), dim=-1).mean()
         loss_iu = 1 - cosine_similarity(i_online, u_target.detach(), dim=-1).mean()
