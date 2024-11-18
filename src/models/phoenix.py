@@ -7,8 +7,13 @@ from torch_geometric.utils import degree
 import scipy.sparse as sp
 import numpy as np
 
+
+from common.abstract_recommender import GeneralRecommender
+from common.loss import BPRLoss, EmbLoss, L2Loss
+from utils.utils import build_sim, compute_normalized_laplacian
+
 # Proposed SOTA Model for Multimodal Recommendation
-class PHOENIX(nn.Module):
+class PHOENIX(GeneralRecommender):
     def __init__(self, config, dataset):
         super(PHOENIX, self).__init__()
         self.embedding_dim = config['embedding_size']
