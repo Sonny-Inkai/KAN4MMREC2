@@ -1,7 +1,6 @@
-# phoenix_plus.py
+# phoenix_enhanced.py
 # coding: utf-8
 
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -26,17 +25,12 @@ class MultiHeadAttention(nn.Module):
 class PHOENIX(GeneralRecommender):
     def __init__(self, config, dataset):
         super(PHOENIX, self).__init__(config, dataset)
-        
+
         # Model parameters
         self.embedding_dim = config['embedding_size']
         self.feat_embed_dim = config['feat_embed_dim']
         self.n_layers = config['n_layers']
         self.dropout = config['dropout']
-        self.alpha = config['alpha']
-        self.beta = config['beta']
-        self.tau = config['tau']
-        self.weight_decay = config['weight_decay']
-        
         self.device = config['device']
         self.n_users = self.n_users
         self.n_items = self.n_items
@@ -47,15 +41,12 @@ class PHOENIX(GeneralRecommender):
         nn.init.xavier_uniform_(self.user_embedding.weight)
         nn.init.xavier_uniform_(self.item_embedding.weight)
 
-        # Attention for multi-modal features
-        self.modality_attention = MultiHeadAttention(self.feat_embed_dim).to(self.device)
-        
-        # GCN layers
+        # GCN layers with residual connections
         self.gcn_layers = nn.ModuleList()
         for _ in range(self.n_layers):
             self.gcn_layers.append(GCNConv(self.embedding_dim, self.embedding_dim).to(self.device))
 
-        # Final attention layer
+        # Attention layer for final output
         self.final_attention = MultiHeadAttention(self.embedding_dim).to(self.device)
 
         # Build graph
@@ -77,19 +68,17 @@ class PHOENIX(GeneralRecommender):
 
         # GCN forward pass
         for layer in self.gcn_layers:
+            x_prev = x
             x = layer(x, self.edge_index)
-            x = F.relu(x)
+            x = F.relu(x + x_prev)  # Residual connection
             x = F.dropout(x, p=self.dropout, training=self.training)
 
         user_gcn_emb, item_gcn_emb = x[:self.n_users], x[self.n_users:]
-        
-        # Attention-based feature aggregation
-        combined_emb = self.modality_attention(item_gcn_emb)
-        
-        # Final attention layer
-        combined_emb = self.final_attention(combined_emb)
 
-        return user_gcn_emb, combined_emb
+        # Final attention layer
+        item_final_emb = self.final_attention(item_gcn_emb)
+
+        return user_gcn_emb, item_final_emb
 
     def calculate_loss(self, interaction):
         users = interaction[0].to(self.device)
