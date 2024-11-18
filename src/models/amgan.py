@@ -83,7 +83,7 @@ class AMGAN(GeneralRecommender):
         i = torch.LongTensor(np.array([row, col]))
         data = torch.FloatTensor(L.data)
 
-        return torch.sparse.FloatTensor(i, data, torch.Size((self.n_nodes, self.n_nodes)))
+        return torch.sparse_coo_tensor(i, data, torch.Size((self.n_nodes, self.n_nodes)))
 
     def forward(self):
         ego_embeddings = torch.cat((self.user_embedding.weight, self.item_id_embedding.weight), dim=0)
