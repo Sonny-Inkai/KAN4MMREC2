@@ -32,6 +32,7 @@ class PHOENIX(GeneralRecommender):
         self.n_layers = config['n_layers']
         self.dropout = config['dropout']
         self.device = config['device']
+        self.weight_decay = config['weight_decay']
         self.n_users = self.n_users
         self.n_items = self.n_items
 
