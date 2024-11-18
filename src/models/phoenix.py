@@ -42,14 +42,14 @@ class PHOENIX(GeneralRecommender):
         self.modality_transforms = {}
         self.modalities = []
 
-        if self.v_feat is not None:
+        if hasattr(self, 'v_feat') and self.v_feat is not None:
             self.modalities.append('visual')
             self.v_feat = F.normalize(self.v_feat.to(self.device), dim=1)
             self.modality_embeddings['visual'] = self.v_feat
             self.modality_transforms['visual'] = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim).to(self.device)
             nn.init.xavier_uniform_(self.modality_transforms['visual'].weight)
 
-        if self.t_feat is not None:
+        if hasattr(self, 't_feat') and self.t_feat is not None:
             self.modalities.append('textual')
             self.t_feat = F.normalize(self.t_feat.to(self.device), dim=1)
             self.modality_embeddings['textual'] = self.t_feat
@@ -76,6 +76,9 @@ class PHOENIX(GeneralRecommender):
         nn.init.xavier_uniform_(self.projection_head[0].weight)
         nn.init.xavier_uniform_(self.projection_head[2].weight)
 
+        # Temperature parameter for SSL
+        self.tau = 0.2
+
         # Build Graph
         self.build_graph(dataset)
 
@@ -90,13 +93,11 @@ class PHOENIX(GeneralRecommender):
         self.edge_index = torch.tensor(edge_index, dtype=torch.long).to(self.device)
 
     def forward(self):
-        # User and Item Embeddings
         user_emb = self.user_embedding.weight
         item_emb = self.item_embedding.weight
 
         x = torch.cat([user_emb, item_emb], dim=0)
         
-        # GCN Propagation
         for gcn in self.gcn_layers:
             x = gcn(x, self.edge_index)
             x = F.relu(x)
@@ -104,15 +105,13 @@ class PHOENIX(GeneralRecommender):
 
         user_gcn_emb, item_gcn_emb = x[:self.n_users], x[self.n_users:]
 
-        # Modality Embeddings
         modality_embeddings = []
         for modality in self.modalities:
-            feat = self.modality_embeddings[modality]  # Already on device
-            transform = self.modality_transforms[modality]  # Already on device
+            feat = self.modality_embeddings[modality]
+            transform = self.modality_transforms[modality]
             emb = transform(feat)
             modality_embeddings.append(emb)
 
-        # Adaptive Modal Fusion using Gating Mechanism
         if modality_embeddings:
             item_all_emb = torch.cat([item_gcn_emb] + modality_embeddings, dim=1)
             gate_values = self.gate_layer(item_all_emb)
@@ -139,42 +138,40 @@ class PHOENIX(GeneralRecommender):
         pos_item_emb = item_final_emb[pos_items]
         neg_item_emb = item_final_emb[neg_items]
 
+        # BPR Loss
         pos_scores = torch.sum(user_emb * pos_item_emb, dim=-1)
         neg_scores = torch.sum(user_emb * neg_item_emb, dim=-1)
         bpr_loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
 
-        ssl_loss = self.calculate_ssl_loss(user_gcn_emb, item_final_emb)
+        # SSL Loss for batch samples only
+        ssl_loss = self.calculate_ssl_loss(user_emb, pos_item_emb)
 
         loss = bpr_loss + self.beta * ssl_loss
 
         return loss
 
     def calculate_ssl_loss(self, user_emb, item_emb):
+        """Calculate SSL loss for the batch samples only"""
+        # Generate augmented embeddings
         user_emb_aug = self.projection_head(F.dropout(user_emb, p=self.dropout))
         item_emb_aug = self.projection_head(F.dropout(item_emb, p=self.dropout))
 
-        user_emb_norm = F.normalize(user_emb_aug, dim=1)
-        item_emb_norm = F.normalize(item_emb_aug, dim=1)
+        # Normalize embeddings
+        user_emb_aug = F.normalize(user_emb_aug, dim=1)
+        item_emb_aug = F.normalize(item_emb_aug, dim=1)
 
-        pos_scores = torch.sum(user_emb_norm * item_emb_norm, dim=1)
-        pos_scores = torch.exp(pos_scores / 0.2)
-
-        neg_scores_u = torch.matmul(user_emb_norm, user_emb_norm.t())
-        neg_scores_i = torch.matmul(item_emb_norm, item_emb_norm.t())
-        neg_scores_u = torch.exp(neg_scores_u / 0.2)
-        neg_scores_i = torch.exp(neg_scores_i / 0.2)
-
-        neg_scores_u = neg_scores_u.fill_diagonal_(0)
-        neg_scores_i = neg_scores_i.fill_diagonal_(0)
-
-        denom_u = neg_scores_u.sum(dim=1)
-        denom_i = neg_scores_i.sum(dim=1)
-
-        ssl_loss_u = -torch.log(pos_scores / (pos_scores + denom_u)).mean()
-        ssl_loss_i = -torch.log(pos_scores / (pos_scores + denom_i)).mean()
-
-        ssl_loss = ssl_loss_u + ssl_loss_i
-
+        # Compute similarity matrix
+        sim_matrix = torch.matmul(user_emb_aug, item_emb_aug.t()) / self.tau
+        
+        # Create labels for positive pairs (diagonal elements should be positive pairs)
+        batch_size = user_emb.size(0)
+        labels = torch.arange(batch_size).to(self.device)
+        
+        # Calculate NCE loss from both directions
+        loss_user = F.cross_entropy(sim_matrix, labels)
+        loss_item = F.cross_entropy(sim_matrix.t(), labels)
+        
+        ssl_loss = (loss_user + loss_item) / 2
         return ssl_loss
 
     def full_sort_predict(self, interaction):
