@@ -17,7 +17,7 @@ from torch.nn.functional import cosine_similarity
 from torch_geometric.nn import GATConv
 
 from common.abstract_recommender import GeneralRecommender
-from common.loss import EmbLoss
+from common.loss import EmbLoss, BPRLoss
 
 class AMGAN(GeneralRecommender):
     def __init__(self, config, dataset):
@@ -43,6 +43,7 @@ class AMGAN(GeneralRecommender):
 
         self.predictor = nn.Linear(self.embedding_dim, self.embedding_dim)
         self.reg_loss = EmbLoss()
+        self.bpr_loss = BPRLoss()
         nn.init.xavier_normal_(self.predictor.weight)
 
         if self.v_feat is not None:
@@ -55,11 +56,15 @@ class AMGAN(GeneralRecommender):
             nn.init.xavier_normal_(self.text_trs.weight)
 
         # Self-Attention Layers for Graph Information
-        self.attention_layer = GATConv(self.embedding_dim, self.embedding_dim, heads=2, concat=False)
+        self.attention_layer = GATConv(self.embedding_dim, self.embedding_dim, heads=4, concat=False)
 
         # Adding Layer Normalization and Dropout for stability and regularization
         self.layer_norm = nn.LayerNorm(self.embedding_dim)
         self.dropout_layer = nn.Dropout(self.dropout)
+
+        # Additional fully connected layer for stabilization
+        self.fc_layer = nn.Linear(self.embedding_dim, self.embedding_dim)
+        nn.init.xavier_normal_(self.fc_layer.weight)
 
     def get_norm_adj_mat(self, interaction_matrix):
         A = sp.dok_matrix((self.n_users + self.n_items,
@@ -102,6 +107,7 @@ class AMGAN(GeneralRecommender):
             all_embeddings += [ego_embeddings]
         all_embeddings = torch.stack(all_embeddings, dim=1)
         all_embeddings = all_embeddings.mean(dim=1, keepdim=False)
+        all_embeddings = F.relu(self.fc_layer(all_embeddings))  # Additional layer for stabilization
         u_g_embeddings, i_g_embeddings = torch.split(all_embeddings, [self.n_users, self.n_items], dim=0)
         return u_g_embeddings, i_g_embeddings + h
 
@@ -150,8 +156,11 @@ class AMGAN(GeneralRecommender):
         loss_ui = 1 - cosine_similarity(u_online, i_target.detach(), dim=-1).mean()
         loss_iu = 1 - cosine_similarity(i_online, u_target.detach(), dim=-1).mean()
 
+        # Adding BPR loss for implicit feedback modeling
+        bpr_loss = self.bpr_loss(u_online_ori[users], i_online_ori[items], i_online_ori[random.sample(range(self.n_items), len(items))])
+
         return (loss_ui + loss_iu).mean() + self.reg_weight * self.reg_loss(u_online_ori, i_online_ori) + \
-               self.cl_weight * (loss_t + loss_v + loss_tv + loss_vt).mean()
+               self.cl_weight * (loss_t + loss_v + loss_tv + loss_vt).mean() + bpr_loss
 
     def full_sort_predict(self, interaction):
         user = interaction[0]
