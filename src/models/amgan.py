@@ -3,7 +3,7 @@
 # Updated by enoche
 # Paper: Self-supervised Learning for Multimedia Recommendation
 # Github: https://github.com/zltao/SLMRec
-# Enhanced: AMGAN++ (with Graph-Freezing, Bootstrap, Self-Attention, Cross-Attention Fusion, Improved Regularization, and Skip Connections)
+#
 
 import os
 import copy
@@ -14,10 +14,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.functional import cosine_similarity
-from torch_geometric.nn import GATConv
 
 from common.abstract_recommender import GeneralRecommender
 from common.loss import EmbLoss, BPRLoss
+
 
 class AMGAN(GeneralRecommender):
     def __init__(self, config, dataset):
@@ -29,11 +29,10 @@ class AMGAN(GeneralRecommender):
         self.reg_weight = config['reg_weight']
         self.cl_weight = config['cl_weight']
         self.dropout = config['dropout']
-        self.lambda_coeff = config["lambda_coeff"]
-        self.knn_k = config["knn_k"]
+
         self.n_nodes = self.n_users + self.n_items
 
-        # Load dataset info
+        # load dataset info
         self.norm_adj = self.get_norm_adj_mat(dataset.inter_matrix(form='coo').astype(np.float32)).to(self.device)
 
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
@@ -44,27 +43,17 @@ class AMGAN(GeneralRecommender):
         self.predictor = nn.Linear(self.embedding_dim, self.embedding_dim)
         self.reg_loss = EmbLoss()
         self.bpr_loss = BPRLoss()
+
         nn.init.xavier_normal_(self.predictor.weight)
 
         if self.v_feat is not None:
             self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
-            self.image_trs = nn.Linear(self.v_feat.size(-1), self.feat_embed_dim)
+            self.image_trs = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
             nn.init.xavier_normal_(self.image_trs.weight)
         if self.t_feat is not None:
             self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
-            self.text_trs = nn.Linear(self.t_feat.size(-1), self.feat_embed_dim)
+            self.text_trs = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
             nn.init.xavier_normal_(self.text_trs.weight)
-
-        # Self-Attention Layers for Graph Information
-        self.attention_layer = GATConv(self.embedding_dim, self.embedding_dim, heads=4, concat=False)
-
-        # Adding Layer Normalization and Dropout for stability and regularization
-        self.layer_norm = nn.LayerNorm(self.embedding_dim)
-        self.dropout_layer = nn.Dropout(self.dropout)
-
-        # Additional fully connected layer for stabilization
-        self.fc_layer = nn.Linear(self.embedding_dim, self.embedding_dim)
-        nn.init.xavier_normal_(self.fc_layer.weight)
 
     def get_norm_adj_mat(self, interaction_matrix):
         A = sp.dok_matrix((self.n_users + self.n_items,
@@ -91,28 +80,23 @@ class AMGAN(GeneralRecommender):
         i = torch.LongTensor(np.array([row, col]))
         data = torch.FloatTensor(L.data)
 
-        return torch.sparse_coo_tensor(i, data, torch.Size((self.n_nodes, self.n_nodes)))
+        return torch.sparse.FloatTensor(i, data, torch.Size((self.n_nodes, self.n_nodes)))
 
     def forward(self):
         h = self.item_id_embedding.weight
 
-        # Apply GAT for self-attention enhanced aggregation with skip connections
         ego_embeddings = torch.cat((self.user_embedding.weight, self.item_id_embedding.weight), dim=0)
         all_embeddings = [ego_embeddings]
         for i in range(self.n_layers):
-            attention_output = self.attention_layer(ego_embeddings, self.norm_adj.coalesce().indices())
-            attention_output = self.layer_norm(attention_output)  # Layer Normalization
-            attention_output = self.dropout_layer(attention_output)  # Dropout for regularization
-            ego_embeddings = ego_embeddings + attention_output  # Skip connection
+            ego_embeddings = torch.sparse.mm(self.norm_adj, ego_embeddings)
             all_embeddings += [ego_embeddings]
         all_embeddings = torch.stack(all_embeddings, dim=1)
         all_embeddings = all_embeddings.mean(dim=1, keepdim=False)
-        all_embeddings = F.relu(self.fc_layer(all_embeddings))  # Additional layer for stabilization
         u_g_embeddings, i_g_embeddings = torch.split(all_embeddings, [self.n_users, self.n_items], dim=0)
         return u_g_embeddings, i_g_embeddings + h
 
     def calculate_loss(self, interactions):
-        # Online network
+        # online network
         u_online_ori, i_online_ori = self.forward()
         t_feat_online, v_feat_online = None, None
         if self.t_feat is not None:
@@ -120,7 +104,6 @@ class AMGAN(GeneralRecommender):
         if self.v_feat is not None:
             v_feat_online = self.image_trs(self.image_embedding.weight)
 
-        # Bootstrap target network with dropout
         with torch.no_grad():
             u_target, i_target = u_online_ori.clone(), i_online_ori.clone()
             u_target.detach()
@@ -136,29 +119,35 @@ class AMGAN(GeneralRecommender):
                 v_feat_target = v_feat_online.clone()
                 v_feat_target = F.dropout(v_feat_target, self.dropout)
 
-        # Predict with cross-attention fusion
         u_online, i_online = self.predictor(u_online_ori), self.predictor(i_online_ori)
+
         users, items = interactions[0], interactions[1]
         u_online = u_online[users, :]
         i_online = i_online[items, :]
         u_target = u_target[users, :]
         i_target = i_target[items, :]
 
-        # Calculate loss terms
         loss_t, loss_v, loss_tv, loss_vt = 0.0, 0.0, 0.0, 0.0
         if self.t_feat is not None:
-            loss_t = 1 - cosine_similarity(t_feat_online[items, :], i_target.detach(), dim=-1).mean()
-            loss_tv = 1 - cosine_similarity(t_feat_online[items, :], t_feat_target[items, :].detach(), dim=-1).mean()
+            t_feat_online = self.predictor(t_feat_online)
+            t_feat_online = t_feat_online[items, :]
+            t_feat_target = t_feat_target[items, :]
+            loss_t = 1 - cosine_similarity(t_feat_online, i_target.detach(), dim=-1).mean()
+            loss_tv = 1 - cosine_similarity(t_feat_online, t_feat_target.detach(), dim=-1).mean()
         if self.v_feat is not None:
-            loss_v = 1 - cosine_similarity(v_feat_online[items, :], i_target.detach(), dim=-1).mean()
-            loss_vt = 1 - cosine_similarity(v_feat_online[items, :], v_feat_target[items, :].detach(), dim=-1).mean()
+            v_feat_online = self.predictor(v_feat_online)
+            v_feat_online = v_feat_online[items, :]
+            v_feat_target = v_feat_target[items, :]
+            loss_v = 1 - cosine_similarity(v_feat_online, i_target.detach(), dim=-1).mean()
+            loss_vt = 1 - cosine_similarity(v_feat_online, v_feat_target.detach(), dim=-1).mean()
 
         loss_ui = 1 - cosine_similarity(u_online, i_target.detach(), dim=-1).mean()
         loss_iu = 1 - cosine_similarity(i_online, u_target.detach(), dim=-1).mean()
 
-        # Adding BPR loss for implicit feedback modeling
-        neg_items = torch.randint(0, self.n_items, items.size(), device=self.device)
-        bpr_loss = self.bpr_loss(u_online_ori[users], i_online_ori[items], i_online_ori[neg_items])
+        # Calculate BPR Loss for sampled negative items
+        neg_items = random.sample(range(self.n_items), len(items))
+        neg_item_embeddings = i_online_ori[neg_items, :]
+        bpr_loss = self.bpr_loss(u_online_ori[users], i_online_ori[items], neg_item_embeddings)
 
         return (loss_ui + loss_iu).mean() + self.reg_weight * self.reg_loss(u_online_ori, i_online_ori) + \
                self.cl_weight * (loss_t + loss_v + loss_tv + loss_vt).mean() + bpr_loss
