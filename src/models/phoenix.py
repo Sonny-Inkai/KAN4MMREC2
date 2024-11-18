@@ -105,11 +105,13 @@ class PHOENIX(GeneralRecommender):
         _, knn_indices = torch.topk(sim_matrix, k=k+1, dim=-1)  # +1 for self-loop
         knn_indices = knn_indices[:, 1:]  # Exclude self-loop
         # Build edge index
-        row_indices = torch.arange(self.item_num).unsqueeze(1).expand(-1, k).flatten()
+        row_indices = torch.arange(self.item_num, device=self.device).unsqueeze(1).expand(-1, k).flatten()
         col_indices = knn_indices.flatten()
         edge_index = torch.stack([row_indices, col_indices], dim=0)
+        # Ensure edge_index is on the correct device (optional)
         edge_index = edge_index.to(self.device)
         return edge_index
+
 
     def forward(self):
         # User-Item Graph Embedding Propagation
