@@ -1,8 +1,8 @@
+# phoenix.py
 # coding: utf-8
-# @email: your_email@example.com
 
 """
-PHOENIX: Hierarchical Graph Neural Network with Dynamic Modality Interaction for Multimodal Recommendation
+PHOENIX: Unified Graph Collaborative Filtering with Adaptive Modal Fusion for Multimodal Recommendation
 """
 
 import os
@@ -13,17 +13,22 @@ import numpy as np
 
 from common.abstract_recommender import GeneralRecommender
 from torch_geometric.nn import GCNConv
+from torch_geometric.utils import add_self_loops, degree
 
 class PHOENIX(GeneralRecommender):
     def __init__(self, config, dataset):
         super(PHOENIX, self).__init__(config, dataset)
 
-        # Model Hyperparameters
-        self.embedding_dim = config['embedding_size']
+        self.embedding_dim = config['embedding_size']  # Assuming 'embedding_size' is defined in the YAML file
         self.feat_embed_dim = config['feat_embed_dim']
         self.n_layers = config['n_layers']
         self.dropout = config['dropout']
         self.alpha = config['alpha']
+        self.beta = config['beta']  # Weight for SSL loss
+        self.k = config['knn_k']
+
+        self.device = config['device']
+
 
         self.n_users = self.n_users
         self.n_items = self.n_items
@@ -35,128 +40,95 @@ class PHOENIX(GeneralRecommender):
         nn.init.xavier_uniform_(self.item_embedding.weight)
 
         # Initialize Modality-specific Embeddings
+        self.modality_embeddings = {}
+        self.modality_transforms = {}
+        self.modalities = []
+
         if self.v_feat is not None:
+            self.modalities.append('visual')
             self.v_feat = F.normalize(self.v_feat, dim=1)
-            in_dim = self.v_feat.shape[1]
-            self.v_transform = nn.Linear(in_dim, self.feat_embed_dim)
-            nn.init.xavier_uniform_(self.v_transform.weight)
+            self.modality_embeddings['visual'] = self.v_feat
+            self.modality_transforms['visual'] = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
+            nn.init.xavier_uniform_(self.modality_transforms['visual'].weight)
+
         if self.t_feat is not None:
+            self.modalities.append('textual')
             self.t_feat = F.normalize(self.t_feat, dim=1)
-            in_dim = self.t_feat.shape[1]
-            self.t_transform = nn.Linear(in_dim, self.feat_embed_dim)
-            nn.init.xavier_uniform_(self.t_transform.weight)
+            self.modality_embeddings['textual'] = self.t_feat
+            self.modality_transforms['textual'] = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
+            nn.init.xavier_uniform_(self.modality_transforms['textual'].weight)
 
-        # GCN Layers for User-Item Graph
-        self.ui_gcn_layers = nn.ModuleList()
+        # GCN Layers for Unified Graph
+        self.gcn_layers = nn.ModuleList()
         for _ in range(self.n_layers):
-            self.ui_gcn_layers.append(GCNConv(self.embedding_dim, self.embedding_dim))
+            self.gcn_layers.append(GCNConv(self.embedding_dim, self.embedding_dim))
 
-        # GCN Layers for Modality-specific Item-Item Graphs
-        self.v_gcn_layers = nn.ModuleList()
-        self.t_gcn_layers = nn.ModuleList()
-        for _ in range(self.n_layers):
-            self.v_gcn_layers.append(GCNConv(self.feat_embed_dim, self.feat_embed_dim))
-            self.t_gcn_layers.append(GCNConv(self.feat_embed_dim, self.feat_embed_dim))
+        # Gating Mechanism for Modal Fusion
+        total_feat_dim = self.embedding_dim + len(self.modalities) * self.feat_embed_dim
+        self.gate_layer = nn.Linear(total_feat_dim, len(self.modalities) + 1)
+        nn.init.xavier_uniform_(self.gate_layer.weight)
 
-        # Attention Mechanism
-        total_feat_dim = self.embedding_dim
-        if self.v_feat is not None:
-            total_feat_dim += self.feat_embed_dim
-        if self.t_feat is not None:
-            total_feat_dim += self.feat_embed_dim
-        self.attention_layer = nn.Linear(total_feat_dim, 1)
-        nn.init.xavier_uniform_(self.attention_layer.weight)
+        # Contrastive Learning Projection Head
+        self.projection_head = nn.Sequential(
+            nn.Linear(self.embedding_dim, self.embedding_dim),
+            nn.ReLU(),
+            nn.Linear(self.embedding_dim, self.embedding_dim)
+        )
+        nn.init.xavier_uniform_(self.projection_head[0].weight)
+        nn.init.xavier_uniform_(self.projection_head[2].weight)
 
-        # Projection layer to match dimensions
-        self.item_proj = nn.Linear(total_feat_dim, self.embedding_dim)
-        nn.init.xavier_uniform_(self.item_proj.weight)
-
-        # Contrastive Loss Function
-        self.ssl_criterion = nn.CrossEntropyLoss()
-
-        # Build Graphs
+        # Build Graph
         self.build_graph(dataset)
 
     def build_graph(self, dataset):
-        # Build User-Item Interaction Graph
+        # Build Unified Interaction Graph
         interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
         user_np = interaction_matrix.row
         item_np = interaction_matrix.col + self.n_users  # Offset item indices
-        edge_index = np.array([np.concatenate([user_np, item_np]),
-                               np.concatenate([item_np, user_np])])
+        ratings = interaction_matrix.data
+        edge_index_ui = np.array([user_np, item_np])
+        edge_index_iu = np.array([item_np, user_np])
+        edge_index = np.concatenate([edge_index_ui, edge_index_iu], axis=1)
         edge_index = torch.tensor(edge_index, dtype=torch.long).to(self.device)
-        self.ui_edge_index = edge_index
-
-        # Build Modality-specific Item-Item Graphs
-        self.item_num = self.n_items
-        self.v_edge_index = None
-        self.t_edge_index = None
-
-        if self.v_feat is not None:
-            self.v_edge_index = self.build_knn_graph(self.v_feat)
-
-        if self.t_feat is not None:
-            self.t_edge_index = self.build_knn_graph(self.t_feat)
-
-    def build_knn_graph(self, features, k=20):
-        # Normalize features
-        features = F.normalize(features, p=2, dim=1)
-        # Compute cosine similarity
-        sim_matrix = torch.mm(features, features.t())
-        # Get top k neighbors
-        _, knn_indices = torch.topk(sim_matrix, k=k+1, dim=-1)  # +1 for self-loop
-        knn_indices = knn_indices[:, 1:]  # Exclude self-loop
-        # Build edge index
-        row_indices = torch.arange(self.item_num, device=self.device).unsqueeze(1).expand(-1, k).flatten()
-        col_indices = knn_indices.flatten()
-        edge_index = torch.stack([row_indices, col_indices], dim=0)
-        # No need to move edge_index to device again since tensors are already on the correct device
-        return edge_index
+        self.edge_index = edge_index
 
     def forward(self):
-        # User-Item Graph Embedding Propagation
+        # User and Item Embeddings
         user_emb = self.user_embedding.weight
         item_emb = self.item_embedding.weight
+
         x = torch.cat([user_emb, item_emb], dim=0)
-        for gcn in self.ui_gcn_layers:
-            x = gcn(x, self.ui_edge_index)
+        # GCN Propagation
+        for gcn in self.gcn_layers:
+            x = gcn(x, self.edge_index)
             x = F.relu(x)
             x = F.dropout(x, p=self.dropout, training=self.training)
+
         user_gcn_emb, item_gcn_emb = x[:self.n_users], x[self.n_users:]
 
-        # Modality-specific Item Embeddings
+        # Modality Embeddings
         modality_embeddings = []
-        if self.v_feat is not None:
-            v_emb = self.v_transform(self.v_feat)
-            for gcn in self.v_gcn_layers:
-                v_emb = gcn(v_emb, self.v_edge_index)
-                v_emb = F.relu(v_emb)
-                v_emb = F.dropout(v_emb, p=self.dropout, training=self.training)
-            modality_embeddings.append(v_emb)
+        for modality in self.modalities:
+            feat = self.modality_embeddings[modality]
+            transform = self.modality_transforms[modality]
+            emb = transform(feat)
+            modality_embeddings.append(emb)
 
-        if self.t_feat is not None:
-            t_emb = self.t_transform(self.t_feat)
-            for gcn in self.t_gcn_layers:
-                t_emb = gcn(t_emb, self.t_edge_index)
-                t_emb = F.relu(t_emb)
-                t_emb = F.dropout(t_emb, p=self.dropout, training=self.training)
-            modality_embeddings.append(t_emb)
-
-        # Combine Modality Embeddings
+        # Adaptive Modal Fusion using Gating Mechanism
         if modality_embeddings:
             item_all_emb = torch.cat([item_gcn_emb] + modality_embeddings, dim=1)
+            gate_values = self.gate_layer(item_all_emb)  # Shape: (n_items, num_modalities + 1)
+            gate_weights = torch.softmax(gate_values, dim=1)  # Normalize weights
+            # Split gate weights
+            g_user_item = gate_weights[:, 0].unsqueeze(1)  # Weight for item_gcn_emb
+            g_modalities = torch.chunk(gate_weights[:, 1:], len(self.modalities), dim=1)
+            # Fuse embeddings
+            item_final_emb = g_user_item * item_gcn_emb
+            for idx, modality_emb in enumerate(modality_embeddings):
+                item_final_emb += g_modalities[idx] * modality_emb
         else:
-            item_all_emb = item_gcn_emb
+            item_final_emb = item_gcn_emb
 
-        # Attention Mechanism
-        attention_scores = self.attention_layer(item_all_emb)
-        attention_weights = torch.sigmoid(attention_scores)
-        item_final_emb = item_all_emb * attention_weights
-
-        # Project item embeddings back to embedding_dim
-        item_final_emb = self.item_proj(item_final_emb)
-
-        # Return final embeddings
         return user_gcn_emb, item_final_emb
 
     def calculate_loss(self, interaction):
@@ -176,33 +148,48 @@ class PHOENIX(GeneralRecommender):
         neg_scores = torch.sum(user_emb * neg_item_emb, dim=-1)
         bpr_loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
 
-        # Contrastive Loss (e.g., between modalities)
-        contrastive_loss = self.compute_contrastive_loss(item_final_emb)
+        # Contrastive Loss (Self-Supervised)
+        ssl_loss = self.calculate_ssl_loss(user_gcn_emb, item_final_emb)
 
         # Total Loss
-        loss = bpr_loss + self.alpha * contrastive_loss
+        loss = bpr_loss + self.beta * ssl_loss
 
         return loss
 
-    def compute_contrastive_loss(self, item_final_emb):
-        # Implement contrastive loss between modalities or between views
-        # For simplicity, let's assume we have modality embeddings
-        losses = []
-        if self.v_feat is not None and self.t_feat is not None:
-            v_emb = self.v_transform(self.v_feat)
-            t_emb = self.t_transform(self.t_feat)
-            v_emb = F.normalize(v_emb, dim=1)
-            t_emb = F.normalize(t_emb, dim=1)
-            # Create labels for contrastive loss
-            labels = torch.arange(self.n_items).to(self.device)
-            # Compute logits
-            logits = torch.matmul(v_emb, t_emb.t()) / 0.1  # Temperature parameter
-            contrastive_loss = self.ssl_criterion(logits, labels)
-            losses.append(contrastive_loss)
-        if losses:
-            return sum(losses) / len(losses)
-        else:
-            return 0.0
+    def calculate_ssl_loss(self, user_emb, item_emb):
+        # Generate augmented views (e.g., by dropout)
+        user_emb_aug = self.projection_head(F.dropout(user_emb, p=self.dropout))
+        item_emb_aug = self.projection_head(F.dropout(item_emb, p=self.dropout))
+
+        # Normalize embeddings
+        user_emb_norm = F.normalize(user_emb_aug, dim=1)
+        item_emb_norm = F.normalize(item_emb_aug, dim=1)
+
+        # Compute similarities
+        pos_scores = torch.sum(user_emb_norm * item_emb_norm, dim=1)
+        pos_scores = torch.exp(pos_scores / 0.2)  # Temperature parameter
+
+        # Negative samples (all other users/items)
+        neg_scores_u = torch.matmul(user_emb_norm, user_emb_norm.t())
+        neg_scores_i = torch.matmul(item_emb_norm, item_emb_norm.t())
+        neg_scores_u = torch.exp(neg_scores_u / 0.2)
+        neg_scores_i = torch.exp(neg_scores_i / 0.2)
+
+        # Masking diagonal elements
+        neg_scores_u = neg_scores_u.fill_diagonal_(0)
+        neg_scores_i = neg_scores_i.fill_diagonal_(0)
+
+        # Sum over negatives
+        denom_u = neg_scores_u.sum(dim=1)
+        denom_i = neg_scores_i.sum(dim=1)
+
+        # SSL Loss
+        ssl_loss_u = -torch.log(pos_scores / (pos_scores + denom_u)).mean()
+        ssl_loss_i = -torch.log(pos_scores / (pos_scores + denom_i)).mean()
+
+        ssl_loss = ssl_loss_u + ssl_loss_i
+
+        return ssl_loss
 
     def full_sort_predict(self, interaction):
         user = interaction[0]
@@ -210,3 +197,4 @@ class PHOENIX(GeneralRecommender):
         user_emb = user_gcn_emb[user]
         scores = torch.matmul(user_emb, item_final_emb.t())
         return scores
+
