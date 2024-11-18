@@ -21,8 +21,6 @@ class PHOENIX(nn.Module):
         self.device = config['device']
 
         # Load dataset information
-        self.n_users = dataset.n_users
-        self.n_items = dataset.n_items
         self.n_nodes = self.n_users + self.n_items
         self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
         self.norm_adj = self.get_norm_adj_mat(self.interaction_matrix).to(self.device)
