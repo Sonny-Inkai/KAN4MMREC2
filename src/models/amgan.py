@@ -157,7 +157,8 @@ class AMGAN(GeneralRecommender):
         loss_iu = 1 - cosine_similarity(i_online, u_target.detach(), dim=-1).mean()
 
         # Adding BPR loss for implicit feedback modeling
-        bpr_loss = self.bpr_loss(u_online_ori[users], i_online_ori[items], i_online_ori[random.sample(range(self.n_items), len(items))])
+        neg_items = torch.randint(0, self.n_items, items.size(), device=self.device)
+        bpr_loss = self.bpr_loss(u_online_ori[users], i_online_ori[items], i_online_ori[neg_items])
 
         return (loss_ui + loss_iu).mean() + self.reg_weight * self.reg_loss(u_online_ori, i_online_ori) + \
                self.cl_weight * (loss_t + loss_v + loss_tv + loss_vt).mean() + bpr_loss
