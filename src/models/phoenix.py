@@ -16,7 +16,7 @@ class PHOENIX(GeneralRecommender):
 
         self.embedding_dim = config["embedding_size"]
         self.feat_embed_dim = config["feat_embed_dim"]
-        self.knn_k = config["knn_k"]
+        self.knn_k = config["knn_k"] 
         self.lambda_coeff = config["lambda_coeff"]
         self.n_layers = config["n_mm_layers"]
         self.reg_weight = config["reg_weight"]
@@ -52,30 +52,38 @@ class PHOENIX(GeneralRecommender):
 
     def build_item_graph(self):
         if self.v_feat is not None:
-            indices, image_adj = self.get_knn_adj_mat(self.image_embedding.weight.detach())
-            self.image_adj = self.compute_normalized_laplacian(indices, image_adj.size()).to(self.device)
+            self.image_adj = self.get_knn_adj_mat(self.image_embedding.weight.detach())
         if self.t_feat is not None:
-            indices, text_adj = self.get_knn_adj_mat(self.text_embedding.weight.detach())
-            self.text_adj = self.compute_normalized_laplacian(indices, text_adj.size()).to(self.device)
+            self.text_adj = self.get_knn_adj_mat(self.text_embedding.weight.detach())
 
     def get_knn_adj_mat(self, mm_embeddings):
+        # Calculate similarity matrix
         sim_mat = build_sim(mm_embeddings)
-        top_k = torch.topk(sim_mat, self.knn_k + 1)
-        indices = top_k.indices
-        values = top_k.values
-        num_nodes = sim_mat.size(0)
-        sparse_indices = torch.stack([indices[:, 1:].flatten(), indices[:, 1:].flatten()])
-        sparse_values = values[:, 1:].flatten()
-        return indices[:, 1:], torch.sparse_coo_tensor(sparse_indices, sparse_values, (num_nodes, num_nodes))
-
-    def compute_normalized_laplacian(self, indices, adj_size):
-        adj = torch.sparse_coo_tensor(indices, torch.ones_like(indices[0]), adj_size)
-        row_sum = torch.sparse.sum(adj, dim=1).to_dense()
-        d_inv_sqrt = torch.pow(row_sum, -0.5)
+        
+        # Get top k similar items
+        vals, inds = torch.topk(sim_mat, self.knn_k + 1)
+        row_inds = torch.arange(sim_mat.size(0)).view(-1, 1).expand(-1, self.knn_k)
+        row_inds = row_inds.reshape(-1)
+        col_inds = inds[:, 1:].reshape(-1)  # Exclude self-loop
+        
+        # Create sparse adjacency matrix
+        indices = torch.stack([row_inds, col_inds])
+        values = torch.ones_like(row_inds).float()
+        adj = torch.sparse_coo_tensor(indices, values, 
+                                    (mm_embeddings.size(0), mm_embeddings.size(0)),
+                                    device=self.device)
+        
+        # Normalize adjacency matrix
+        rowsum = torch.sparse.sum(adj, dim=1).to_dense()
+        d_inv_sqrt = torch.pow(rowsum, -0.5)
         d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.
         d_mat_inv_sqrt = torch.diag(d_inv_sqrt)
-        normalized_laplacian = torch.mm(torch.mm(d_mat_inv_sqrt, adj.to_dense()), d_mat_inv_sqrt)
-        return normalized_laplacian.to_sparse()
+        
+        # Calculate normalized adjacency matrix
+        adj_dense = adj.to_dense()
+        norm_adj = torch.mm(torch.mm(d_mat_inv_sqrt, adj_dense), d_mat_inv_sqrt)
+        
+        return norm_adj.to_sparse()
 
     def get_norm_adj_mat(self):
         A = sp.dok_matrix((self.n_users + self.n_items, self.n_users + self.n_items), dtype=np.float32)
@@ -96,7 +104,7 @@ class PHOENIX(GeneralRecommender):
         i = torch.LongTensor(np.array([row, col]))
         data = torch.FloatTensor(L.data)
         SparseL = torch.sparse_coo_tensor(i, data, torch.Size(L.shape))
-        return SparseL.to(self.device)
+        return SparseL
 
     def forward(self):
         h = self.item_id_embedding.weight
