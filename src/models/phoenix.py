@@ -1,117 +1,196 @@
-# phoenix_ultimate.py
-# coding: utf-8
-
+# phoenix.py
+import os
+import numpy as np
+import scipy.sparse as sp
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
+
 from common.abstract_recommender import GeneralRecommender
-from torch_geometric.nn import GCNConv
-from torch_geometric.utils import add_self_loops
-
-class MultiHeadAttention(nn.Module):
-    def __init__(self, dim, num_heads=4):
-        super().__init__()
-        self.num_heads = num_heads
-        self.attention = nn.MultiheadAttention(dim, num_heads)
-        self.layer_norm = nn.LayerNorm(dim)
-
-    def forward(self, x):
-        x = x.unsqueeze(0)
-        attn_output, _ = self.attention(x, x, x)
-        attn_output = self.layer_norm(attn_output + x)  # Add residual connection
-        return attn_output.squeeze(0)
+from common.loss import BPRLoss, EmbLoss
+from utils.utils import build_sim, compute_normalized_laplacian
 
 class PHOENIX(GeneralRecommender):
     def __init__(self, config, dataset):
         super(PHOENIX, self).__init__(config, dataset)
 
-        # Model parameters
-        self.embedding_dim = config['embedding_size']
-        self.feat_embed_dim = config['feat_embed_dim']
-        self.n_layers = config['n_layers']
-        self.dropout = config['dropout']
-        self.device = config['device']
-        self.n_users = self.n_users
-        self.n_items = self.n_items
+        self.embedding_dim = config["embedding_size"]
+        self.feat_embed_dim = config["feat_embed_dim"]
+        self.knn_k = config["knn_k"]
+        self.lambda_coeff = config["lambda_coeff"]
+        self.n_layers = config["n_mm_layers"]
+        self.reg_weight = config["reg_weight"]
+        self.contrast_weight = config["contrast_weight"]
+        self.dropout = config["dropout"]
+        self.mm_fusion_mode = config["mm_fusion_mode"]
+        self.n_ui_layers = config["n_ui_layers"]
+        self.temp = config["temp"]
+        
+        self.n_nodes = self.n_users + self.n_items
 
-        # Initialize embeddings
-        self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim).to(self.device)
-        self.item_embedding = nn.Embedding(self.n_items, self.embedding_dim).to(self.device)
+        # load dataset info
+        self.interaction_matrix = dataset.inter_matrix(form="coo").astype(np.float32)
+        self.norm_adj = self.get_norm_adj_mat().to(self.device)
+
+        self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
+        self.item_id_embedding = nn.Embedding(self.n_items, self.embedding_dim)
         nn.init.xavier_uniform_(self.user_embedding.weight)
-        nn.init.xavier_uniform_(self.item_embedding.weight)
+        nn.init.xavier_uniform_(self.item_id_embedding.weight)
 
-        # Stacked GCN layers
-        self.gcn_layers = nn.ModuleList()
-        for _ in range(self.n_layers):
-            self.gcn_layers.append(GCNConv(self.embedding_dim, self.embedding_dim).to(self.device))
+        if self.v_feat is not None:
+            self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
+            self.image_trs = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
+        if self.t_feat is not None:
+            self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
+            self.text_trs = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
 
-        # Cross-modal attention
-        self.cross_modal_attention = MultiHeadAttention(self.embedding_dim).to(self.device)
+        self.predictor = nn.Linear(self.embedding_dim, self.embedding_dim)
+        self.reg_loss = EmbLoss()
 
-        # Final attention layer
-        self.final_attention = MultiHeadAttention(self.embedding_dim).to(self.device)
+        # Build item-item graph
+        self.build_item_graph()
 
-        # Build graph
-        self.build_graph(dataset)
+    def build_item_graph(self):
+        if self.v_feat is not None:
+            indices, image_adj = self.get_knn_adj_mat(self.image_embedding.weight.detach())
+            self.image_adj = self.compute_normalized_laplacian(indices, image_adj.size()).to(self.device)
+        if self.t_feat is not None:
+            indices, text_adj = self.get_knn_adj_mat(self.text_embedding.weight.detach())
+            self.text_adj = self.compute_normalized_laplacian(indices, text_adj.size()).to(self.device)
 
-    def build_graph(self, dataset):
-        interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
-        user_np = interaction_matrix.row
-        item_np = interaction_matrix.col + self.n_users
-        edge_index = np.array([user_np, item_np])
-        self.edge_index = torch.tensor(edge_index, dtype=torch.long).to(self.device)
-        self.edge_index, _ = add_self_loops(self.edge_index)
+    def get_knn_adj_mat(self, mm_embeddings):
+        sim_mat = build_sim(mm_embeddings)
+        top_k = torch.topk(sim_mat, self.knn_k + 1)
+        indices = top_k.indices
+        values = top_k.values
+        return indices[:, 1:], torch.sparse_coo_tensor(indices[:, 1:], values[:, 1:], sim_mat.size())
+
+    def compute_normalized_laplacian(self, indices, adj_size):
+        adj = torch.sparse_coo_tensor(indices, torch.ones_like(indices[0]), adj_size)
+        row_sum = torch.sparse.sum(adj, dim=1).to_dense()
+        d_inv_sqrt = torch.pow(row_sum, -0.5)
+        d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.
+        d_mat_inv_sqrt = torch.diag(d_inv_sqrt)
+        normalized_laplacian = torch.mm(torch.mm(d_mat_inv_sqrt, adj.to_dense()), d_mat_inv_sqrt)
+        return normalized_laplacian.to_sparse()
+
+    def get_norm_adj_mat(self):
+        A = sp.dok_matrix((self.n_users + self.n_items, self.n_users + self.n_items), dtype=np.float32)
+        inter_M = self.interaction_matrix
+        inter_M_t = self.interaction_matrix.transpose()
+        data_dict = dict(zip(zip(inter_M.row, inter_M.col + self.n_users), [1] * inter_M.nnz))
+        data_dict.update(dict(zip(zip(inter_M_t.row + self.n_users, inter_M_t.col), [1] * inter_M_t.nnz)))
+        A._update(data_dict)
+        sumArr = (A > 0).sum(axis=1)
+        diag = np.array(sumArr.flatten())[0] + 1e-7
+        diag = np.power(diag, -0.5)
+        D = sp.diags(diag)
+        L = D * A * D
+        L = sp.coo_matrix(L)
+        row = L.row
+        col = L.col
+        i = torch.LongTensor(np.array([row, col]))
+        data = torch.FloatTensor(L.data)
+        SparseL = torch.sparse.FloatTensor(i, data, torch.Size(L.shape))
+        return SparseL.to(self.device)
 
     def forward(self):
-        user_emb = self.user_embedding.weight
-        item_emb = self.item_embedding.weight
+        h = self.item_id_embedding.weight
 
-        x = torch.cat([user_emb, item_emb], dim=0)
+        # Perform graph convolutions on the item-item graph
+        if self.v_feat is not None:
+            h_v = h
+            for _ in range(self.n_layers):
+                h_v = torch.sparse.mm(self.image_adj, h_v)
+        if self.t_feat is not None:
+            h_t = h
+            for _ in range(self.n_layers):
+                h_t = torch.sparse.mm(self.text_adj, h_t)
 
-        # Stacked GCN forward pass
-        for layer in self.gcn_layers:
-            x_prev = x
-            x = layer(x, self.edge_index)
-            x = F.relu(x + x_prev)  # Residual connection
-            x = F.dropout(x, p=self.dropout, training=self.training)
+        # Perform graph convolutions on the user-item graph
+        ego_embeddings = torch.cat((self.user_embedding.weight, self.item_id_embedding.weight), dim=0)
+        all_embeddings = [ego_embeddings]
+        for _ in range(self.n_ui_layers):
+            ego_embeddings = torch.sparse.mm(self.norm_adj, ego_embeddings)
+            all_embeddings.append(ego_embeddings)
+        all_embeddings = torch.stack(all_embeddings, dim=1)
+        all_embeddings = all_embeddings.mean(dim=1, keepdim=False)
+        u_g_embeddings, i_g_embeddings = torch.split(all_embeddings, [self.n_users, self.n_items], dim=0)
 
-        user_gcn_emb, item_gcn_emb = x[:self.n_users], x[self.n_users:]
+        # Fuse representations from different modalities
+        if self.mm_fusion_mode == "concat":
+            if self.v_feat is not None and self.t_feat is not None:
+                i_embeddings = torch.cat((i_g_embeddings, h_v, h_t), dim=1)
+            elif self.v_feat is not None:
+                i_embeddings = torch.cat((i_g_embeddings, h_v), dim=1)
+            elif self.t_feat is not None:
+                i_embeddings = torch.cat((i_g_embeddings, h_t), dim=1)
+            else:
+                i_embeddings = i_g_embeddings
+        elif self.mm_fusion_mode == "mean":
+            if self.v_feat is not None and self.t_feat is not None:
+                i_embeddings = (i_g_embeddings + h_v + h_t) / 3
+            elif self.v_feat is not None:
+                i_embeddings = (i_g_embeddings + h_v) / 2
+            elif self.t_feat is not None:
+                i_embeddings = (i_g_embeddings + h_t) / 2
+            else:
+                i_embeddings = i_g_embeddings
+        else:
+            raise ValueError("Invalid mm_fusion_mode: " + self.mm_fusion_mode)
 
-        # Cross-modal attention
-        item_combined_emb = self.cross_modal_attention(item_gcn_emb)
+        return u_g_embeddings, i_embeddings
 
-        # Final attention layer
-        final_emb = self.final_attention(item_combined_emb)
+    def bpr_loss(self, users, pos_items, neg_items):
+        users_emb = self.user_embedding(users.long())
+        pos_emb = self.item_id_embedding(pos_items.long())
+        neg_emb = self.item_id_embedding(neg_items.long())
+        pos_scores = torch.sum(torch.mul(users_emb, pos_emb), dim=1)
+        neg_scores = torch.sum(torch.mul(users_emb, neg_emb), dim=1)
+        bpr_loss = -torch.log(torch.sigmoid(pos_scores - neg_scores)).mean()
+        return bpr_loss
 
-        return user_gcn_emb, final_emb
+    def contrast_loss(self, users, items):
+        users_emb = self.predictor(self.user_embedding(users.long()))
+        items_emb = self.predictor(self.item_id_embedding(items.long()))
+
+        users_emb = F.normalize(users_emb, dim=1)
+        items_emb = F.normalize(items_emb, dim=1)
+
+        pos_scores = torch.sum(torch.mul(users_emb, items_emb), dim=1)
+        pos_scores = torch.exp(pos_scores / self.temp)
+
+        mask = torch.eye(items.size(0), dtype=torch.bool).to(self.device)
+        all_scores = torch.mm(users_emb, items_emb.t())
+        all_scores = torch.exp(all_scores / self.temp)
+        all_scores = all_scores.masked_fill(mask, 0)
+
+        contrast_loss = -torch.log(pos_scores / (all_scores.sum(dim=1) + 1e-8)).mean()
+        return contrast_loss
 
     def calculate_loss(self, interaction):
-        users = interaction[0].to(self.device)
-        pos_items = interaction[1].to(self.device)
-        neg_items = interaction[2].to(self.device)
+        users = interaction[0]
+        pos_items = interaction[1]
+        neg_items = interaction[2]
 
-        user_gcn_emb, item_final_emb = self.forward()
+        ua_embeddings, ia_embeddings = self.forward()
 
-        user_emb = user_gcn_emb[users]
-        pos_item_emb = item_final_emb[pos_items]
-        neg_item_emb = item_final_emb[neg_items]
+        u_g_embeddings = ua_embeddings[users]
+        pos_i_g_embeddings = ia_embeddings[pos_items]
+        neg_i_g_embeddings = ia_embeddings[neg_items]
 
-        # BPR Loss
-        pos_scores = torch.sum(user_emb * pos_item_emb, dim=-1)
-        neg_scores = torch.sum(user_emb * neg_item_emb, dim=-1)
-        bpr_loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
+        batch_mf_loss = self.bpr_loss(users, pos_items, neg_items)
+        batch_contrast_loss = self.contrast_loss(users, pos_items)
+        batch_reg_loss = self.reg_weight * self.reg_loss(u_g_embeddings, pos_i_g_embeddings, neg_i_g_embeddings)
 
-        # L2 Regularization
-        l2_reg = self.weight_decay * (torch.norm(user_emb) + torch.norm(pos_item_emb) + torch.norm(neg_item_emb))
-
-        # Combined loss
-        loss = bpr_loss + l2_reg
-        return loss
+        return batch_mf_loss + self.contrast_weight * batch_contrast_loss + batch_reg_loss
 
     def full_sort_predict(self, interaction):
-        user = interaction[0].to(self.device)
-        user_gcn_emb, item_final_emb = self.forward()
-        user_emb = user_gcn_emb[user]
-        scores = torch.matmul(user_emb, item_final_emb.t())
+        user = interaction[0]
+
+        restore_user_e, restore_item_e = self.forward()
+        u_embeddings = restore_user_e[user]
+
+        # Compute scores using dot product
+        scores = torch.matmul(u_embeddings, restore_item_e.transpose(0, 1))
         return scores
