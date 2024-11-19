@@ -63,7 +63,8 @@ class PHOENIX(GeneralRecommender):
         top_k = torch.topk(sim_mat, self.knn_k + 1)
         indices = top_k.indices
         values = top_k.values
-        return indices[:, 1:], torch.sparse_coo_tensor(indices[:, 1:], values[:, 1:], sim_mat.size())
+        num_nodes = sim_mat.size(0)
+        return indices[:, 1:], torch.sparse_coo_tensor(indices[:, 1:], values[:, 1:], (num_nodes, num_nodes))
 
     def compute_normalized_laplacian(self, indices, adj_size):
         adj = torch.sparse_coo_tensor(indices, torch.ones_like(indices[0]), adj_size)
@@ -92,7 +93,7 @@ class PHOENIX(GeneralRecommender):
         col = L.col
         i = torch.LongTensor(np.array([row, col]))
         data = torch.FloatTensor(L.data)
-        SparseL = torch.sparse.FloatTensor(i, data, torch.Size(L.shape))
+        SparseL = torch.sparse_coo_tensor(i, data, torch.Size(L.shape))
         return SparseL.to(self.device)
 
     def forward(self):
