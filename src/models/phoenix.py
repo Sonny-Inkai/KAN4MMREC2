@@ -203,6 +203,6 @@ class PHOENIX(GeneralRecommender):
         restore_user_e, restore_item_e = self.forward()
         u_embeddings = restore_user_e[user]
 
-        # Compute scores using dot product
-        scores = torch.matmul(u_embeddings, restore_item_e.transpose(0, 1))
+        # Make sure dimensions match for matrix multiplication
+        scores = torch.matmul(u_embeddings, restore_item_e.t())
         return scores
