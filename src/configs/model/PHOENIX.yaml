@@ -7,5 +7,5 @@ reg_weight: 0.001
 contrast_weight: 0.1
 dropout: 0.6
 mm_fusion_mode: "mean"
-n_ui_layers: 2
+n_ui_layers: 3
 temp: 0.1
