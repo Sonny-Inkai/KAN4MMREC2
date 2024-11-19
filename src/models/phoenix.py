@@ -52,9 +52,9 @@ class PHOENIX(GeneralRecommender):
 
     def build_item_graph(self):
         if self.v_feat is not None:
-            self.image_adj = self.get_knn_adj_mat(self.image_embedding.weight.detach())
+            self.image_adj = self.get_knn_adj_mat(self.image_embedding.weight)
         if self.t_feat is not None:
-            self.text_adj = self.get_knn_adj_mat(self.text_embedding.weight.detach())
+            self.text_adj = self.get_knn_adj_mat(self.text_embedding.weight)
 
     def get_knn_adj_mat(self, mm_embeddings):
         # Calculate similarity matrix
@@ -62,13 +62,13 @@ class PHOENIX(GeneralRecommender):
         
         # Get top k similar items
         vals, inds = torch.topk(sim_mat, self.knn_k + 1)
-        row_inds = torch.arange(sim_mat.size(0)).view(-1, 1).expand(-1, self.knn_k)
+        row_inds = torch.arange(sim_mat.size(0), device=self.device).view(-1, 1).expand(-1, self.knn_k)
         row_inds = row_inds.reshape(-1)
         col_inds = inds[:, 1:].reshape(-1)  # Exclude self-loop
         
         # Create sparse adjacency matrix
         indices = torch.stack([row_inds, col_inds])
-        values = torch.ones_like(row_inds).float()
+        values = torch.ones_like(row_inds, device=self.device).float()
         adj = torch.sparse_coo_tensor(indices, values, 
                                     (mm_embeddings.size(0), mm_embeddings.size(0)),
                                     device=self.device)
