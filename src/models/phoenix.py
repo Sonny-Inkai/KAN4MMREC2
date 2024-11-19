@@ -129,14 +129,19 @@ class PHOENIX(GeneralRecommender):
         all_embeddings = all_embeddings.mean(dim=1, keepdim=False)
         u_g_embeddings, i_g_embeddings = torch.split(all_embeddings, [self.n_users, self.n_items], dim=0)
 
-        # Fuse representations from different modalities
+        # Make sure all embeddings have the same dimension as embedding_dim
         if self.mm_fusion_mode == "concat":
+            final_dim = self.embedding_dim
             if self.v_feat is not None and self.t_feat is not None:
-                i_embeddings = torch.cat((i_g_embeddings, h_v, h_t), dim=1)
+                h_v = h_v[:, :final_dim]
+                h_t = h_t[:, :final_dim]
+                i_embeddings = (i_g_embeddings + h_v + h_t) / 3
             elif self.v_feat is not None:
-                i_embeddings = torch.cat((i_g_embeddings, h_v), dim=1)
+                h_v = h_v[:, :final_dim]
+                i_embeddings = (i_g_embeddings + h_v) / 2
             elif self.t_feat is not None:
-                i_embeddings = torch.cat((i_g_embeddings, h_t), dim=1)
+                h_t = h_t[:, :final_dim]
+                i_embeddings = (i_g_embeddings + h_t) / 2
             else:
                 i_embeddings = i_g_embeddings
         elif self.mm_fusion_mode == "mean":
@@ -152,7 +157,6 @@ class PHOENIX(GeneralRecommender):
             raise ValueError("Invalid mm_fusion_mode: " + self.mm_fusion_mode)
 
         return u_g_embeddings, i_embeddings
-
     def bpr_loss(self, users, pos_items, neg_items):
         users_emb = self.user_embedding(users.long())
         pos_emb = self.item_id_embedding(pos_items.long())
