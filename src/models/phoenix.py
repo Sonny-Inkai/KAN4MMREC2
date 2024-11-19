@@ -64,7 +64,9 @@ class PHOENIX(GeneralRecommender):
         indices = top_k.indices
         values = top_k.values
         num_nodes = sim_mat.size(0)
-        return indices[:, 1:], torch.sparse_coo_tensor(indices[:, 1:], values[:, 1:], (num_nodes, num_nodes))
+        sparse_indices = torch.stack([indices[:, 1:].flatten(), indices[:, 1:].flatten()])
+        sparse_values = values[:, 1:].flatten()
+        return indices[:, 1:], torch.sparse_coo_tensor(sparse_indices, sparse_values, (num_nodes, num_nodes))
 
     def compute_normalized_laplacian(self, indices, adj_size):
         adj = torch.sparse_coo_tensor(indices, torch.ones_like(indices[0]), adj_size)
