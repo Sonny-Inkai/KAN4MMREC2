@@ -165,9 +165,11 @@ class HERCULES(GeneralRecommender):
         users_emb = self.user_embedding(users.long())
         pos_emb = self.item_id_embedding(pos_items.long())
         neg_emb = self.item_id_embedding(neg_items.long())
+        
         pos_scores = torch.sum(torch.mul(users_emb, pos_emb), dim=1)
         neg_scores = torch.sum(torch.mul(users_emb, neg_emb), dim=1)
-        bpr_loss = -torch.log(torch.sigmoid(pos_scores - neg_scores)).mean()
+        
+        bpr_loss = -torch.mean(torch.log(torch.sigmoid(pos_scores - neg_scores) + 1e-8))
         return bpr_loss
 
     def contrast_loss(self, users, items):
@@ -180,12 +182,12 @@ class HERCULES(GeneralRecommender):
         pos_scores = torch.sum(torch.mul(users_emb, items_emb), dim=1)
         pos_scores = torch.exp(pos_scores / self.temp)
 
-        mask = torch.eye(items.size(0), dtype=torch.bool).to(self.device)
+        mask = torch.eye(items.size(0), dtype=torch.bool, device=self.device)
         all_scores = torch.mm(users_emb, items_emb.t())
         all_scores = torch.exp(all_scores / self.temp)
         all_scores = all_scores.masked_fill(mask, 0)
 
-        contrast_loss = -torch.log(pos_scores / (all_scores.sum(dim=1) + 1e-8)).mean()
+        contrast_loss = -torch.mean(torch.log((pos_scores / (all_scores.sum(dim=1) + 1e-8)) + 1e-8))
         return contrast_loss
 
     def attribute_loss(self, users, items):
@@ -200,23 +202,34 @@ class HERCULES(GeneralRecommender):
         pos_items = interaction[1]
         neg_items = interaction[2]
 
+        # Get embeddings
         ua_embeddings, ia_embeddings = self.forward()
-
         u_g_embeddings = ua_embeddings[users]
         pos_i_g_embeddings = ia_embeddings[pos_items]
         neg_i_g_embeddings = ia_embeddings[neg_items]
 
+        # Calculate individual losses with detached embeddings where needed
         batch_mf_loss = self.bpr_loss(users, pos_items, neg_items)
+        
+        # Calculate contrast loss
         batch_contrast_loss = self.contrast_loss(users, pos_items)
+        
+        # Calculate attribute loss
         batch_attribute_loss = self.attribute_loss(users, pos_items)
 
+        # Calculate regularization loss
         batch_reg_loss = self.reg_weight * (
-            self.reg_loss(u_g_embeddings, pos_i_g_embeddings, neg_i_g_embeddings) +
-            self.reg_loss(self.user_preference.weight, self.item_attribute.weight)
+            self.reg_loss(u_g_embeddings.detach(), pos_i_g_embeddings.detach(), neg_i_g_embeddings.detach()) +
+            self.reg_loss(self.user_preference.weight.detach(), self.item_attribute.weight.detach())
         )
 
-        return batch_mf_loss + self.contrast_weight * batch_contrast_loss + \
-               self.lam * batch_attribute_loss + batch_reg_loss
+        # Combine all losses
+        total_loss = batch_mf_loss + \
+                    self.contrast_weight * batch_contrast_loss + \
+                    self.lam * batch_attribute_loss + \
+                    batch_reg_loss
+
+        return total_loss
 
     def full_sort_predict(self, interaction):
         user = interaction[0]
