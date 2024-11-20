@@ -211,7 +211,7 @@ class MultiHeadAttention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.dropout = nn.Dropout(dropout)
         
-    def forward(self, x, key=None, value=None):
+    def forward(self, x, key=None, value=None, mask=None):
         # Add batch dimension if needed
         if len(x.shape) == 2:
             x = x.unsqueeze(0)
@@ -241,6 +241,18 @@ class MultiHeadAttention(nn.Module):
         
         # Attention
         attn = (q @ k.transpose(-2, -1)) * self.scale
+        
+        # Apply mask if provided
+        if mask is not None:
+            if len(mask.shape) == 2:
+                mask = mask.unsqueeze(0)
+            # Convert sparse tensor to dense if necessary
+            if mask.is_sparse:
+                mask = mask.to_dense()
+            # Expand mask for attention heads
+            mask = mask.unsqueeze(1).expand(-1, self.n_heads, -1, -1)
+            attn = attn.masked_fill(mask == 0, -1e9)
+            
         attn = attn.softmax(dim=-1)
         attn = self.dropout(attn)
         
@@ -254,7 +266,6 @@ class MultiHeadAttention(nn.Module):
             x = x.squeeze(0)
             
         return x
-
 class ModalityTransformer(nn.Module):
     def __init__(self, input_dim, hidden_dim, n_heads, n_layers, dropout):
         super().__init__()
