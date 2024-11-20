@@ -1,12 +1,79 @@
-embedding_size: 64
-feat_embed_dim: 64
-knn_k: 10
-lambda_coeff: 0.1
-n_mm_layers: 2
-reg_weight: 0.0001
-contrast_weight: 0.1
-dropout: 0.3
-mm_fusion_mode: concat
-n_ui_layers: 2
-temp: 0.2
-lambda: 0.1
+# HERO.yaml
+
+# Model Parameters
+embedding_size: 64  # Dimension of user/item embeddings
+feat_embed_dim: 64  # Dimension for projected modal features
+n_mm_layers: 2     # Number of multimodal graph layers
+n_ui_layers: 2     # Number of user-item graph layers
+n_heads: 4         # Number of attention heads for transformers
+knn_k: 10         # Number of neighbors for KNN graph construction
+
+# Training Parameters
+learning_rate: 0.001
+train_batch_size: 2048
+eval_batch_size: 256
+epochs: 1000
+early_stopping: 20
+
+# Regularization & Dropout
+dropout: 0.3      # Dropout rate
+reg_weight: 1e-4  # L2 regularization weight
+contrast_weight: 0.2  # Weight for contrastive loss
+temperature: 0.2  # Temperature for softmax in contrastive learning
+
+# Modality Fusion
+mm_fusion_mode: 'gate'  # Options: gate, concat, sum
+mm_image_weight: 0.5   # Weight for visual modality in fusion
+
+# Optimizer
+optimizer: 'adam'
+weight_decay: 0.0001
+momentum: 0.9
+scheduler: 'reduceLR'
+lr_scheduler_patience: 5
+lr_scheduler_factor: 0.5
+min_lr: 0.00001
+
+# Dataset Processing
+dataset: 'baby'  # Options: baby, sports, clothing
+data_path: 'data/'
+max_seq_len: 50
+min_seq_len: 3
+
+# Evaluation
+metrics: ['recall', 'ndcg']
+k: [10, 20, 50]  # K values for evaluation metrics
+val_interval: 1
+test_interval: 1
+
+# Device
+use_gpu: True
+device_id: 0
+seed: 2023
+
+# Logging & Saving
+save_model: True
+checkpoint_dir: 'saved'
+log_interval: 100
+verbose: True
+
+# Advanced Parameters
+# Graph Learning
+graph_dropout: 0.3
+edge_dropout: 0.3
+node_dropout: 0.1
+ssl_temp: 0.1
+ssl_reg: 1e-7
+prototype_size: 100
+
+# Attention
+attention_probs_dropout: 0.1
+hidden_dropout_prob: 0.1
+hidden_act: 'gelu'
+layer_norm_eps: 1e-12
+
+# Training Tricks
+warm_up_epochs: 20
+pretrain_epochs: 100
+clip_grad_norm: 1.0
+weight_init: 'xavier_normal'
