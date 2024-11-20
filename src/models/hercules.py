@@ -65,17 +65,19 @@ class HERCULES(GeneralRecommender):
     def get_knn_adj_mat(self, mm_embeddings):
         # Calculate similarity matrix
         sim_mat = build_sim(mm_embeddings)
+        sim_mat = sim_mat.to(self.device)
         
         # Get top k similar items
         vals, inds = torch.topk(sim_mat, self.knn_k)
         
         # Create sparse adjacency matrix
-        row_inds = torch.arange(sim_mat.size(0)).view(-1, 1).expand(-1, self.knn_k).reshape(-1)
+        row_inds = torch.arange(sim_mat.size(0), device=self.device).view(-1, 1).expand(-1, self.knn_k).reshape(-1)
         col_inds = inds.reshape(-1)
         
         indices = torch.stack([row_inds, col_inds])
         values = vals.reshape(-1)
-        adj = torch.sparse_coo_tensor(indices, values, sim_mat.size())
+        
+        adj = torch.sparse_coo_tensor(indices, values, sim_mat.size(), device=self.device)
         
         # Normalize adjacency matrix
         rowsum = torch.sparse.sum(adj, dim=1).to_dense()
@@ -83,9 +85,10 @@ class HERCULES(GeneralRecommender):
         d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.
         d_mat_inv_sqrt = torch.diag(d_inv_sqrt)
         
-        norm_adj = torch.sparse.mm(torch.sparse.mm(d_mat_inv_sqrt, adj), d_mat_inv_sqrt)
+        adj_dense = adj.to_dense()
+        norm_adj = torch.mm(torch.mm(d_mat_inv_sqrt, adj_dense), d_mat_inv_sqrt)
         
-        return norm_adj
+        return norm_adj.to_sparse()
 
     def get_norm_adj_mat(self):
         A = sp.dok_matrix((self.n_users + self.n_items, self.n_users + self.n_items), dtype=np.float32)
@@ -134,13 +137,13 @@ class HERCULES(GeneralRecommender):
 
         # Fuse representations from different modalities
         if self.v_feat is not None and self.t_feat is not None:
-            i_embeddings = torch.cat((i_g_embeddings, h_v, h_t, h_a), dim=1)
+            i_embeddings = (i_g_embeddings + h_v + h_t + h_a) / 4
         elif self.v_feat is not None:
-            i_embeddings = torch.cat((i_g_embeddings, h_v, h_a), dim=1)
+            i_embeddings = (i_g_embeddings + h_v + h_a) / 3
         elif self.t_feat is not None:
-            i_embeddings = torch.cat((i_g_embeddings, h_t, h_a), dim=1)
+            i_embeddings = (i_g_embeddings + h_t + h_a) / 3
         else:
-            i_embeddings = torch.cat((i_g_embeddings, h_a), dim=1)
+            i_embeddings = (i_g_embeddings + h_a) / 2
 
         # Apply dropout for regularization
         u_g_embeddings = F.dropout(u_g_embeddings, p=self.dropout, training=self.training)
