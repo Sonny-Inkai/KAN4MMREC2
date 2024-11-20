@@ -157,6 +157,7 @@ class PHOENIX(GeneralRecommender):
             raise ValueError("Invalid mm_fusion_mode: " + self.mm_fusion_mode)
 
         return u_g_embeddings, i_embeddings
+    
     def bpr_loss(self, users, pos_items, neg_items):
         users_emb = self.user_embedding(users.long())
         pos_emb = self.item_id_embedding(pos_items.long())
