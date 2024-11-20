@@ -136,7 +136,7 @@ class FREEDOM(GeneralRecommender):
                 )
             )
         )
-        for key, value in data_dict.items:
+        for key, value in data_dict.items():
             A[key] = value
         # norm adj matrix
         sumArr = (A > 0).sum(axis=1)
