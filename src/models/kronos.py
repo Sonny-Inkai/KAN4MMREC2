@@ -199,37 +199,6 @@ class KRONOS(GeneralRecommender):
         scores, _, _ = self.forward(users, torch.arange(self.n_items).to(self.device))
         return scores
     
-# Supporting modules for KRONOS
-
-class ModalityTransformer(nn.Module):
-    def __init__(self, input_dim, hidden_dim, n_heads, n_layers, dropout):
-        super().__init__()
-        self.projection = nn.Linear(input_dim, hidden_dim)
-        self.layers = nn.ModuleList([
-            TransformerLayer(hidden_dim, n_heads, dropout)
-            for _ in range(n_layers)
-        ])
-        self.norm = nn.LayerNorm(hidden_dim)
-        
-    def forward(self, x):
-        x = self.projection(x)
-        for layer in self.layers:
-            x = layer(x)
-        return self.norm(x)
-
-class TransformerLayer(nn.Module):
-    def __init__(self, dim, n_heads, dropout):
-        super().__init__()
-        self.attention = MultiHeadAttention(dim, n_heads, dropout)
-        self.ffn = FeedForward(dim, dropout)
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-        
-    def forward(self, x):
-        x = self.norm1(x + self.attention(x))
-        x = self.norm2(x + self.ffn(x))
-        return x
-
 class MultiHeadAttention(nn.Module):
     def __init__(self, dim, n_heads, dropout):
         super().__init__()
@@ -242,18 +211,98 @@ class MultiHeadAttention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.dropout = nn.Dropout(dropout)
         
-    def forward(self, x):
+    def forward(self, x, key=None, value=None):
+        # Add batch dimension if needed
+        if len(x.shape) == 2:
+            x = x.unsqueeze(0)
+            
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
         
+        if key is None:
+            key = x
+        if value is None:
+            value = x
+            
+        # Make sure key and value have batch dimension
+        if len(key.shape) == 2:
+            key = key.unsqueeze(0)
+        if len(value.shape) == 2:
+            value = value.unsqueeze(0)
+            
+        # Linear projections
+        q = self.qkv(x)[:, :, :self.dim]
+        k = self.qkv(key)[:, :, self.dim:2*self.dim]
+        v = self.qkv(value)[:, :, 2*self.dim:]
+        
+        # Reshape to multi-head attention format
+        q = q.reshape(B, N, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = k.reshape(B, k.size(1), self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = v.reshape(B, v.size(1), self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+        
+        # Attention
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
         attn = self.dropout(attn)
         
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        # Combine heads
+        x = (attn @ v).transpose(1, 2).reshape(B, N, self.dim)
         x = self.proj(x)
         x = self.dropout(x)
+        
+        # Remove batch dimension if it was added
+        if B == 1:
+            x = x.squeeze(0)
+            
+        return x
+
+class ModalityTransformer(nn.Module):
+    def __init__(self, input_dim, hidden_dim, n_heads, n_layers, dropout):
+        super().__init__()
+        self.projection = nn.Linear(input_dim, hidden_dim)
+        self.layers = nn.ModuleList([
+            TransformerLayer(hidden_dim, n_heads, dropout)
+            for _ in range(n_layers)
+        ])
+        self.norm = nn.LayerNorm(hidden_dim)
+        
+    def forward(self, x):
+        # Add batch dimension if needed
+        if len(x.shape) == 2:
+            x = x.unsqueeze(0)
+            
+        x = self.projection(x)
+        
+        for layer in self.layers:
+            x = layer(x)
+            
+        x = self.norm(x)
+        
+        # Remove batch dimension if it was added
+        if x.size(0) == 1:
+            x = x.squeeze(0)
+            
+        return x
+
+class TransformerLayer(nn.Module):
+    def __init__(self, dim, n_heads, dropout):
+        super().__init__()
+        self.attention = MultiHeadAttention(dim, n_heads, dropout)
+        self.ffn = FeedForward(dim, dropout)
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        
+    def forward(self, x):
+        # Add batch dimension if needed
+        if len(x.shape) == 2:
+            x = x.unsqueeze(0)
+            
+        x = self.norm1(x + self.attention(x))
+        x = self.norm2(x + self.ffn(x))
+        
+        # Remove batch dimension if it was added
+        if x.size(0) == 1:
+            x = x.squeeze(0)
+            
         return x
 
 class FeedForward(nn.Module):
@@ -299,10 +348,24 @@ class GraphTransformer(nn.Module):
                 PreNorm(dim, FeedForward(dim, dropout))
             ]))
         
-    def forward(self, x, adj):
+    def forward(self, x, adj=None):
+        # Add batch dimension if needed
+        if len(x.shape) == 2:
+            x = x.unsqueeze(0)
+            
         for attn, ff in self.layers:
-            x = attn(x, mask=adj) + x
+            if adj is not None:
+                # Apply adjacency matrix as attention mask
+                mask = adj.unsqueeze(0) if len(adj.shape) == 2 else adj
+                x = attn(x, mask=mask) + x
+            else:
+                x = attn(x) + x
             x = ff(x) + x
+        
+        # Remove batch dimension if it was added
+        if x.size(0) == 1:
+            x = x.squeeze(0)
+            
         return x
 
 class InterestExtractor(nn.Module):
@@ -314,9 +377,18 @@ class InterestExtractor(nn.Module):
         nn.init.xavier_normal_(self.interest_embeddings)
         
     def forward(self, user_emb):
+        # Add batch dimension if needed
+        if len(user_emb.shape) == 2:
+            user_emb = user_emb.unsqueeze(0)
+            
         B = user_emb.size(0)
         interests = repeat(self.interest_embeddings, 'n d -> b n d', b=B)
-        interests = self.attention(interests, user_emb.unsqueeze(1))
+        interests = self.attention(interests, user_emb)
+        
+        # Remove batch dimension if it was added
+        if B == 1:
+            interests = interests.squeeze(0)
+            
         return interests
 
 class HierarchicalContrastive(nn.Module):
