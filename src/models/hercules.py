@@ -28,6 +28,12 @@ class HERCULES(GeneralRecommender):
         
         self.n_nodes = self.n_users + self.n_items
         
+        # Load interaction matrix
+        self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
+        self.edge_indices, self.edge_values = self.get_edge_info()
+        self.edge_indices = torch.LongTensor(self.edge_indices).t().contiguous().to(self.device)
+        self.edge_values = torch.FloatTensor(self.edge_values).to(self.device)
+        
         # Initialize embeddings
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
         self.item_embedding = nn.Embedding(self.n_items, self.embedding_dim)
@@ -37,7 +43,7 @@ class HERCULES(GeneralRecommender):
         # Get normalized adjacency matrix
         self.norm_adj = self.get_norm_adj_mat().to(self.device)
         
-        # Multi-modal feature projectors 
+        # Multi-modal feature projectors
         if self.v_feat is not None:
             self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
             self.image_encoder = EnhancedEncoder(
@@ -49,7 +55,7 @@ class HERCULES(GeneralRecommender):
             self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
             self.text_encoder = EnhancedEncoder(
                 input_dim=self.t_feat.shape[1],
-                hidden_dim=self.feat_embed_dim,  
+                hidden_dim=self.feat_embed_dim,
                 n_heads=self.n_heads
             )
 
@@ -78,6 +84,13 @@ class HERCULES(GeneralRecommender):
             nn.PReLU(),
             nn.Linear(self.feat_embed_dim, self.feat_embed_dim)
         )
+
+    def get_edge_info(self):
+        rows = self.interaction_matrix.row
+        cols = self.interaction_matrix.col + self.n_users
+        edges = np.column_stack((rows, cols))
+        values = np.ones(len(rows))
+        return edges, values
 
     def get_norm_adj_mat(self):
         # Convert to PyTorch sparse tensor
@@ -190,80 +203,3 @@ class HERCULES(GeneralRecommender):
         u_embeddings = user_embeddings[user]
         scores = torch.matmul(u_embeddings, item_embeddings.t())
         return scores
-
-class EnhancedEncoder(nn.Module):
-    def __init__(self, input_dim, hidden_dim, n_heads):
-        super().__init__()
-        self.attention = nn.MultiheadAttention(input_dim, n_heads)
-        self.norm1 = nn.LayerNorm(input_dim) 
-        self.ffn = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim*4),
-            nn.PReLU(),
-            nn.Linear(hidden_dim*4, hidden_dim),
-            nn.Dropout(0.1)
-        )
-        self.norm2 = nn.LayerNorm(hidden_dim)
-        
-    def forward(self, x):
-        # Self attention
-        attn_out, _ = self.attention(x, x, x)
-        x = self.norm1(x + attn_out)
-        
-        # FFN
-        out = self.ffn(x)
-        out = self.norm2(x + out)
-        return out
-
-class ModalityFusion(nn.Module):
-    def __init__(self, dim, n_heads):
-        super().__init__()
-        self.attention = nn.MultiheadAttention(dim, n_heads)
-        self.gate = nn.Sequential(
-            nn.Linear(dim*2, 2),
-            nn.Softmax(dim=-1)
-        )
-        
-    def forward(self, visual, textual):
-        # Cross attention
-        fused, _ = self.attention(visual, textual, textual)
-        
-        # Gating
-        gate_input = torch.cat([visual, textual], dim=-1)
-        weights = self.gate(gate_input)
-        
-        out = weights[:,:1] * visual + weights[:,1:] * textual
-        return out
-        
-class AdaptiveGraphLearner(nn.Module):
-    def __init__(self, dim, k, temp=0.1):
-        super().__init__()
-        self.k = k
-        self.temp = temp
-        
-    def forward(self, x):
-        # Compute similarity
-        sim = torch.matmul(x, x.transpose(0, 1)) 
-        sim = sim / self.temp
-        
-        # Get top-k
-        values, indices = torch.topk(sim, self.k, dim=-1)
-        mask = torch.zeros_like(sim)
-        mask.scatter_(-1, indices, 1)
-        
-        # Sparsify
-        adj = sim * mask
-        
-        # Symmetrize
-        adj = (adj + adj.transpose(0,1))/2
-        return adj
-
-class MessagePassingLayer(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.weight = nn.Parameter(torch.Tensor(dim, dim))
-        nn.init.xavier_uniform_(self.weight)
-        
-    def forward(self, x, adj):
-        support = torch.matmul(x, self.weight)
-        out = torch.matmul(adj, support)
-        return out + x  # Residual
