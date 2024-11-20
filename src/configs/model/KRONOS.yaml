@@ -1,8 +1,8 @@
 # Model Configuration
-embedding_size: 64
-feat_embed_dim: 128
+embedding_size: 32
+feat_embed_dim: 64
 n_mm_layers: 2
-n_heads: 8
+n_heads: 4
 n_prototypes: 64
 dropout: 0.2
 temperature: 0.07
