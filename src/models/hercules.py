@@ -93,18 +93,15 @@ class HERCULES(GeneralRecommender):
         return edges, values
 
     def get_norm_adj_mat(self):
-        # Convert to PyTorch sparse tensor
         def _convert_sp_mat_to_sp_tensor(X):
             coo = X.tocoo()
             indices = torch.LongTensor([coo.row, coo.col])
             data = torch.FloatTensor(coo.data)
             return torch.sparse.FloatTensor(indices, data, torch.Size(coo.shape))
 
-        # Build adjacency matrix
         adj_mat = sp.dok_matrix((self.n_nodes, self.n_nodes))
         adj_mat = adj_mat.tocsr() + sp.eye(adj_mat.shape[0])
         
-        # Normalize
         rowsum = np.array(adj_mat.sum(1))
         d_inv = np.power(rowsum, -0.5).flatten()
         d_inv[np.isinf(d_inv)] = 0
@@ -127,19 +124,15 @@ class HERCULES(GeneralRecommender):
         else:
             mm_feat = v_feat if v_feat is not None else t_feat
 
-        # Apply dropout if in training
         if dropout and self.training:
             mm_feat = F.dropout(mm_feat, p=self.dropout)
 
-        # Learn adaptive graph structure
         learned_graph = self.graph_learner(mm_feat)
         
-        # Message passing on learned graph 
         item_emb = mm_feat
         for gnn in self.gnn_layers:
             item_emb = gnn(item_emb, learned_graph)
 
-        # User-item interactions with LightGCN
         ego_embeddings = torch.cat([self.user_embedding.weight, item_emb], dim=0)
         all_embeddings = [ego_embeddings]
         
@@ -161,11 +154,9 @@ class HERCULES(GeneralRecommender):
         pos_items = interaction[1]
         neg_items = interaction[2]
 
-        # Get embeddings with and without dropout
         clean_user_emb, clean_item_emb = self.forward(dropout=False)
         aug_user_emb, aug_item_emb = self.forward(dropout=True)
 
-        # BPR Loss
         u_embeddings = clean_user_emb[users]
         pos_embeddings = clean_item_emb[pos_items]
         neg_embeddings = clean_item_emb[neg_items]
@@ -175,7 +166,6 @@ class HERCULES(GeneralRecommender):
         
         bpr_loss = -F.logsigmoid(pos_scores - neg_scores).mean()
 
-        # Contrastive Loss
         u_embeddings_aug = aug_user_emb[users]
         pos_embeddings_aug = aug_item_emb[pos_items]
 
@@ -187,15 +177,13 @@ class HERCULES(GeneralRecommender):
         
         con_loss = -F.logsigmoid(pos_scores/self.temp - neg_scores/self.temp).mean()
 
-        # L2 regularization
         l2_loss = self.reg_weight * (
             torch.norm(u_embeddings) +
             torch.norm(pos_embeddings) + 
             torch.norm(neg_embeddings)
         )
 
-        loss = bpr_loss + self.contrast_weight * con_loss + l2_loss
-        return loss
+        return bpr_loss + self.contrast_weight * con_loss + l2_loss
 
     def full_sort_predict(self, interaction):
         user = interaction[0]
@@ -207,10 +195,13 @@ class HERCULES(GeneralRecommender):
 class EnhancedEncoder(nn.Module):
     def __init__(self, input_dim, hidden_dim, n_heads):
         super().__init__()
-        self.attention = nn.MultiheadAttention(input_dim, n_heads)
-        self.norm1 = nn.LayerNorm(input_dim) 
+        # Initial projection
+        self.projection = nn.Linear(input_dim, hidden_dim)
+        # Attention after projection
+        self.attention = nn.MultiheadAttention(hidden_dim, n_heads, batch_first=True)
+        self.norm1 = nn.LayerNorm(hidden_dim)
         self.ffn = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim*4),
+            nn.Linear(hidden_dim, hidden_dim*4),
             nn.PReLU(),
             nn.Linear(hidden_dim*4, hidden_dim),
             nn.Dropout(0.1)
@@ -218,27 +209,38 @@ class EnhancedEncoder(nn.Module):
         self.norm2 = nn.LayerNorm(hidden_dim)
         
     def forward(self, x):
+        # Project to hidden dimension
+        x = self.projection(x)
+        # Add batch dimension for attention
+        x = x.unsqueeze(0)
         # Self attention
         attn_out, _ = self.attention(x, x, x)
         x = self.norm1(x + attn_out)
-        
         # FFN
         out = self.ffn(x)
         out = self.norm2(x + out)
-        return out
+        # Remove batch dimension
+        return out.squeeze(0)
 
 class ModalityFusion(nn.Module):
     def __init__(self, dim, n_heads):
         super().__init__()
-        self.attention = nn.MultiheadAttention(dim, n_heads)
+        self.attention = nn.MultiheadAttention(dim, n_heads, batch_first=True)
         self.gate = nn.Sequential(
             nn.Linear(dim*2, 2),
             nn.Softmax(dim=-1)
         )
         
     def forward(self, visual, textual):
+        # Add batch dimension
+        visual = visual.unsqueeze(0)
+        textual = textual.unsqueeze(0)
         # Cross attention
         fused, _ = self.attention(visual, textual, textual)
+        # Remove batch dimension
+        fused = fused.squeeze(0)
+        visual = visual.squeeze(0)
+        textual = textual.squeeze(0)
         
         # Gating
         gate_input = torch.cat([visual, textual], dim=-1)
@@ -246,7 +248,7 @@ class ModalityFusion(nn.Module):
         
         out = weights[:,:1] * visual + weights[:,1:] * textual
         return out
-        
+
 class AdaptiveGraphLearner(nn.Module):
     def __init__(self, dim, k, temp=0.1):
         super().__init__()
@@ -254,19 +256,14 @@ class AdaptiveGraphLearner(nn.Module):
         self.temp = temp
         
     def forward(self, x):
-        # Compute similarity
         sim = torch.matmul(x, x.transpose(0, 1)) 
         sim = sim / self.temp
         
-        # Get top-k
         values, indices = torch.topk(sim, self.k, dim=-1)
         mask = torch.zeros_like(sim)
         mask.scatter_(-1, indices, 1)
         
-        # Sparsify
         adj = sim * mask
-        
-        # Symmetrize
         adj = (adj + adj.transpose(0,1))/2
         return adj
 
