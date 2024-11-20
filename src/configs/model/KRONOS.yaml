@@ -1,9 +1,9 @@
 # Model Configuration
-embedding_size: 32
-feat_embed_dim: 32
+embedding_size: 16
+feat_embed_dim: 16
 n_mm_layers: 2
-n_heads: 4
-n_prototypes: 32
+n_heads: 2
+n_prototypes: 16
 dropout: 0.2
 temperature: 0.07
 ssl_temperature: 0.1
