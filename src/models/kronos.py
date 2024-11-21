@@ -59,9 +59,6 @@ class KRONOS(GeneralRecommender):
             LightweightGNN(self.feat_embed_dim) 
             for _ in range(self.n_layers)
         ])
-        
-        # Predictors
-        self.predictor = nn.Linear(self.feat_embed_dim, self.feat_embed_dim)
 
     def get_norm_adj_mat(self):
         def _convert_sp_mat_to_sp_tensor(X):
@@ -79,7 +76,7 @@ class KRONOS(GeneralRecommender):
         norm_adj = d_mat.dot(adj_mat).dot(d_mat)
         return _convert_sp_mat_to_sp_tensor(norm_adj)
 
-    def forward(self, users, items):
+    def forward(self):
         # Process modalities
         v_feat = t_feat = None
         if self.v_feat is not None:
@@ -108,37 +105,42 @@ class KRONOS(GeneralRecommender):
         all_emb = torch.stack(embs, dim=1).mean(dim=1)
         user_emb, item_emb = torch.split(all_emb, [self.n_users, self.n_items])
         
-        # Get final embeddings
-        u_embeddings = user_emb[users]
-        i_embeddings = item_emb[items]
-        
-        # Predict scores
-        scores = torch.mul(self.predictor(u_embeddings), i_embeddings).sum(dim=1)
-        
-        return scores
+        return user_emb, item_emb
 
     def calculate_loss(self, interaction):
-        users = interaction[0]
-        pos_items = interaction[1]
-        neg_items = interaction[2]
+        user = interaction[0]
+        pos_item = interaction[1]
+        neg_item = interaction[2]
+
+        user_all_emb, item_all_emb = self.forward()
         
-        pos_scores = self.forward(users, pos_items)
-        neg_scores = self.forward(users, neg_items)
+        u_embeddings = user_all_emb[user]
+        pos_embeddings = item_all_emb[pos_item]
+        neg_embeddings = item_all_emb[neg_item]
+
+        # Calculate scores
+        pos_scores = torch.mul(u_embeddings, pos_embeddings).sum(dim=1)
+        neg_scores = torch.mul(u_embeddings, neg_embeddings).sum(dim=1)
         
         # BPR loss
         bpr_loss = -torch.mean(torch.log(torch.sigmoid(pos_scores - neg_scores) + 1e-8))
         
         # L2 regularization
         reg_loss = self.reg_weight * (
-            torch.norm(self.user_embedding.weight) +
-            torch.norm(self.item_embedding.weight)
+            torch.norm(u_embeddings) +
+            torch.norm(pos_embeddings) +
+            torch.norm(neg_embeddings)
         )
         
         return bpr_loss + reg_loss
 
     def full_sort_predict(self, interaction):
-        users = interaction[0]
-        scores = self.forward(users, torch.arange(self.n_items).to(self.device))
+        user = interaction[0]
+        
+        user_all_emb, item_all_emb = self.forward()
+        u_embeddings = user_all_emb[user]
+        
+        scores = torch.matmul(u_embeddings, item_all_emb.t())
         return scores
 
 class ModalityEncoder(nn.Module):
