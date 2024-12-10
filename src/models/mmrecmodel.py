@@ -32,7 +32,7 @@ class MMRECMODEL(GeneralRecommender):
         # load dataset info
         self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
         self.norm_adj = self.get_norm_adj_mat().to(self.device)
-        self.masked_adj, self.mm_adj = None, None
+        self.masked_adj, self.mm_adj = None, self.norm_adj
         self.edge_indices, self.edge_values = self.get_edge_info()
         self.edge_indices, self.edge_values = self.edge_indices.to(self.device), self.edge_values.to(self.device)
         self.edge_full_indices = torch.arange(self.edge_values.size(0)).to(self.device)
