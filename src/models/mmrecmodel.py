@@ -186,9 +186,9 @@ class Base_gcn(nn.Module):
         self.out_channels = out_channels
         self.fc = nn.Linear(in_channels, out_channels)
 
-    def forward(self, x, edge_index):
+    def forward(self, x):
         x = self.fc(x)
         return x
 
-    def __repr(self):
+    def __repr__(self):
         return '{}({},{})'.format(self.__class__.__name__, self.in_channels, self.out_channels)
