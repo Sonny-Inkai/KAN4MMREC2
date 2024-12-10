@@ -18,7 +18,6 @@ class MMRECMODEL(GeneralRecommender):
         self.feat_embed_dim = config['feat_embed_dim']
         self.knn_k = config['knn_k']
         self.lambda_coeff = config['lambda_coeff']
-        self.cf_model = config['cf_model']
         self.n_layers = config['n_mm_layers']
         self.n_ui_layers = config['n_ui_layers']
         self.reg_weight = config['reg_weight']
