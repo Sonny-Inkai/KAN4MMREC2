@@ -10,9 +10,9 @@ from torch.nn.functional import cosine_similarity
 from common.abstract_recommender import GeneralRecommender
 from common.loss import BPRLoss, EmbLoss, L2Loss
 
-class MMHybrid(GeneralRecommender):
+class MMRECMODEL(GeneralRecommender):
     def __init__(self, config, dataset):
-        super(MMHybrid, self).__init__(config, dataset)
+        super(MMRECMODEL, self).__init__(config, dataset)
 
         self.embedding_dim = config['embedding_size']
         self.feat_embed_dim = config['feat_embed_dim']
