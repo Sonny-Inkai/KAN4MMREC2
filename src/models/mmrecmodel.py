@@ -10,9 +10,9 @@ from torch.nn.functional import cosine_similarity
 from common.abstract_recommender import GeneralRecommender
 from common.loss import BPRLoss, EmbLoss, L2Loss
 
-class MMRECMODEL(GeneralRecommender):
+class MMHybrid(GeneralRecommender):
     def __init__(self, config, dataset):
-        super(MMRECMODEL, self).__init__(config, dataset)
+        super(MMHybrid, self).__init__(config, dataset)
 
         self.embedding_dim = config['embedding_size']
         self.feat_embed_dim = config['feat_embed_dim']
@@ -56,8 +56,8 @@ class MMRECMODEL(GeneralRecommender):
         self.text_trs = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
         nn.init.xavier_normal_(self.text_trs.weight)
 
-        self.conv_embed_1 = Base_gcn(self.embedding_dim, self.embedding_dim, aggr='add')
-        self.conv_embed_2 = Base_gcn(self.embedding_dim, self.embedding_dim, aggr='add')
+        self.conv_embed_1 = Base_gcn(self.embedding_dim, self.embedding_dim)
+        self.conv_embed_2 = Base_gcn(self.embedding_dim, self.embedding_dim)
 
     def get_norm_adj_mat(self):
         A = sp.dok_matrix((self.n_users + self.n_items, self.n_users + self.n_items), dtype=np.float32)
@@ -81,7 +81,7 @@ class MMRECMODEL(GeneralRecommender):
         i = torch.LongTensor(np.array([row, col]))
         data = torch.FloatTensor(L.data)
 
-        return torch.sparse.FloatTensor(i, data, torch.Size((self.n_nodes, self.n_nodes)))
+        return torch.sparse_coo_tensor(i, data, torch.Size((self.n_nodes, self.n_nodes)))
 
     def get_edge_info(self):
         rows = torch.from_numpy(self.interaction_matrix.row)
@@ -92,7 +92,7 @@ class MMRECMODEL(GeneralRecommender):
         return edges, values
 
     def _normalize_adj_m(self, indices, adj_size):
-        adj = torch.sparse.FloatTensor(indices, torch.ones_like(indices[0]), adj_size)
+        adj = torch.sparse_coo_tensor(indices, torch.ones_like(indices[0]), adj_size)
         row_sum = 1e-7 + torch.sparse.sum(adj, -1).to_dense()
         col_sum = 1e-7 + torch.sparse.sum(adj.t(), -1).to_dense()
         r_inv_sqrt = torch.pow(row_sum, -0.5)
@@ -117,7 +117,7 @@ class MMRECMODEL(GeneralRecommender):
         # update keep_indices to users/items+self.n_users
         keep_indices[1] += self.n_users
         all_indices = torch.cat((keep_indices, torch.flip(keep_indices, [0])), 1)
-        self.masked_adj = torch.sparse.FloatTensor(all_indices, all_values, self.norm_adj.shape).to(self.device)
+        self.masked_adj = torch.sparse_coo_tensor(all_indices, all_values, self.norm_adj.shape).to(self.device)
 
     def forward(self):
         h = self.item_id_embedding.weight
@@ -181,30 +181,15 @@ class MMRECMODEL(GeneralRecommender):
         return scores
 
 class Base_gcn(nn.Module):
-    def __init__(self, in_channels, out_channels, normalize=True, bias=True, aggr='add', **kwargs):
-        super(Base_gcn, self).__init__(aggr=aggr, **kwargs)
-        self.aggr = aggr
+    def __init__(self, in_channels, out_channels):
+        super(Base_gcn, self).__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
+        self.fc = nn.Linear(in_channels, out_channels)
 
-    def forward(self, x, edge_index, size=None):
-        if size is None:
-            edge_index, _ = remove_self_loops(edge_index)
-            edge_index, _ = add_self_loops(edge_index, num_nodes=x.size(0))
-        x = x.unsqueeze(-1) if x.dim() == 1 else x
-        return self.propagate(edge_index, size=(x.size(0), x.size(0)), x=x)
-
-    def message(self, x_j, edge_index, size):
-        if self.aggr == 'add':
-            row, col = edge_index
-            deg = degree(row, size[0], dtype=x_j.dtype)
-            deg_inv_sqrt = deg.pow(-0.5)
-            norm = deg_inv_sqrt[row] * deg_inv_sqrt[col]
-            return norm.view(-1, 1) * x_j
-        return x_j
-
-    def update(self, aggr_out):
-        return aggr_out
+    def forward(self, x, edge_index):
+        x = self.fc(x)
+        return x
 
     def __repr(self):
         return '{}({},{})'.format(self.__class__.__name__, self.in_channels, self.out_channels)
