@@ -30,3 +30,6 @@ degree_ratio: 0.5
 # Additional hyperparameters
 use_neg_sampling: False
 knn_k: 10
+
+n_mm_layers: 1
+cl_weight: 2.0
