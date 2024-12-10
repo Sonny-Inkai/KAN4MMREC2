@@ -164,11 +164,36 @@ class LIGHTMMREC(GeneralRecommender):
         user = interaction[0]
         user_emb = self.user_embedding(user)
         
-        all_items = torch.arange(self.n_items).to(self.device)
-        item_emb = self.item_id_embedding(all_items)
-        fused_item_features = self.progressive_fusion(user_emb.unsqueeze(1).expand(-1, self.n_items, -1).reshape(-1, self.embedding_dim),
-                                                    item_emb.unsqueeze(0).expand(user_emb.size(0), -1, -1).reshape(-1, self.embedding_dim),
-                                                    all_items)
+        # Initialize tensor to store all scores
+        scores = torch.zeros((user_emb.size(0), self.n_items)).to(self.device)
         
-        score = torch.mul(user_emb.unsqueeze(1), fused_item_features.view(user_emb.size(0), -1, self.embedding_dim)).sum(dim=-1)
-        return score
+        # Process in batches to avoid memory issues
+        batch_size = 512  # Adjust this value based on available GPU memory
+        for i in range(0, self.n_items, batch_size):
+            end_idx = min(i + batch_size, self.n_items)
+            batch_items = torch.arange(i, end_idx).to(self.device)
+            
+            item_emb = self.item_id_embedding(batch_items)
+            
+            # Expand user embeddings to match current batch size
+            current_batch_size = end_idx - i
+            batch_user_emb = user_emb.unsqueeze(1).expand(-1, current_batch_size, -1)
+            batch_user_emb = batch_user_emb.reshape(-1, self.embedding_dim)
+            
+            # Expand item embeddings
+            batch_item_emb = item_emb.unsqueeze(0).expand(user_emb.size(0), -1, -1)
+            batch_item_emb = batch_item_emb.reshape(-1, self.embedding_dim)
+            
+            # Get fused features for current batch
+            fused_item_features = self.progressive_fusion(batch_user_emb, batch_item_emb, batch_items)
+            
+            # Calculate scores for current batch
+            batch_scores = torch.mul(
+                batch_user_emb,
+                fused_item_features
+            ).sum(dim=-1)
+            
+            # Store scores in the correct position
+            scores[:, i:end_idx] = batch_scores.view(user_emb.size(0), -1)
+        
+        return scores
