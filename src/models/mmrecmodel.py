@@ -43,6 +43,15 @@ class MMRECMODEL(GeneralRecommender):
         self.mm_fusion = MultiModalFusion(self.embedding_dim, self.feat_embed_dim)
 
         self.fc_layers = nn.ModuleList([nn.Linear(self.embedding_dim, self.embedding_dim) for _ in range(self.n_ui_layers)])
+    
+    def bpr_loss(self, users, pos_items, neg_items):
+        pos_scores = torch.sum(torch.mul(users, pos_items), dim=1)
+        neg_scores = torch.sum(torch.mul(users, neg_items), dim=1)
+
+        maxi = F.logsigmoid(pos_scores - neg_scores)
+        mf_loss = -torch.mean(maxi)
+
+        return mf_loss
 
     def forward(self):
         u_embeddings = self.user_embedding.weight
@@ -75,18 +84,15 @@ class MMRECMODEL(GeneralRecommender):
         pos_i_g_embeddings = i_g_embeddings[pos_items]
         neg_i_g_embeddings = i_g_embeddings[neg_items]
 
-        # Check shapes
-        print(f'u_g_embeddings shape: {u_g_embeddings.shape}')
-        print(f'pos_i_g_embeddings shape: {pos_i_g_embeddings.shape}')
-        print(f'neg_i_g_embeddings shape: {neg_i_g_embeddings.shape}')
-
         # Ensure embeddings are float tensors
         u_g_embeddings = u_g_embeddings.float()
         pos_i_g_embeddings = pos_i_g_embeddings.float()
         neg_i_g_embeddings = neg_i_g_embeddings.float()
 
         # Calculate loss
-        batch_mf_loss = BPRLoss()(u_g_embeddings, pos_i_g_embeddings, neg_i_g_embeddings)
+        batch_mf_loss = self.bpr_loss(
+            u_g_embeddings, pos_i_g_embeddings, neg_i_g_embeddings
+        )
 
         return batch_mf_loss + self.reg_weight * (u_g_embeddings.norm(2).pow(2) +
                                                     pos_i_g_embeddings.norm(2).pow(2) +
