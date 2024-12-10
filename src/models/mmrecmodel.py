@@ -42,8 +42,7 @@ class MMRECMODEL(GeneralRecommender):
 
         self.mm_fusion = MultiModalFusion(self.embedding_dim, self.feat_embed_dim)
 
-        self.conv_embed_1 = nn.Conv2d(1, 1, kernel_size=(3, 3), padding=(1, 1))
-        self.conv_embed_2 = nn.Conv2d(1, 1, kernel_size=(3, 3), padding=(1, 1))
+        self.fc_layers = nn.ModuleList([nn.Linear(self.embedding_dim, self.embedding_dim) for _ in range(self.n_ui_layers)])
 
     def forward(self):
         u_embeddings = self.user_embedding.weight
@@ -57,7 +56,7 @@ class MMRECMODEL(GeneralRecommender):
         ego_embeddings = torch.cat((u_embeddings, i_embeddings), dim=0)
         all_embeddings = [ego_embeddings]
         for i in range(self.n_ui_layers):
-            ego_embeddings = F.relu(self.conv_embed_1(ego_embeddings.unsqueeze(1).unsqueeze(1))).squeeze(-1).squeeze(-1)
+            ego_embeddings = F.relu(self.fc_layers[i](ego_embeddings))
             all_embeddings += [ego_embeddings]
         all_embeddings = torch.stack(all_embeddings, dim=1)
         all_embeddings = all_embeddings.mean(dim=1, keepdim=False)
