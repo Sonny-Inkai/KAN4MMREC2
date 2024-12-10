@@ -1,11 +1,12 @@
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from common.abstract_recommender import GeneralRecommender
 
-class LIGHTMMREC(GeneralRecommender):
+class LightMMRec(GeneralRecommender):
     def __init__(self, config, dataset):
-        super(LIGHTMMREC, self).__init__(config, dataset)
+        super(LightMMRec, self).__init__(config, dataset)
         
         self.embedding_dim = config['embedding_size']
         self.feat_embed_dim = config['feat_embed_dim']
@@ -43,8 +44,6 @@ class LIGHTMMREC(GeneralRecommender):
         ])
         
         self.feature_cache = {}
-        self.cache_hits = {m: 0 for m in self.available_modalities}
-        self.cache_misses = {m: 0 for m in self.available_modalities}
 
     def build_fcn(self, input_dim):
         return nn.Sequential(
@@ -74,66 +73,35 @@ class LIGHTMMREC(GeneralRecommender):
             nn.Linear(self.feat_embed_dim, self.feat_embed_dim)
         )
 
-    def get_cached_features(self, modal_name, indices):
-        if modal_name not in self.feature_cache:
-            self.feature_cache[modal_name] = {}
-            
-        cache = self.feature_cache[modal_name]
-        features = []
-        uncached_indices = []
-        
-        for idx in indices:
-            idx = idx.item()
-            if idx in cache:
-                features.append(cache[idx])
-                self.cache_hits[modal_name] += 1
-            else:
-                uncached_indices.append(idx)
-                self.cache_misses[modal_name] += 1
-                
-        return features, uncached_indices
-
-    def update_cache(self, modal_name, indices, features):
-        cache = self.feature_cache[modal_name]
-        for idx, feat in zip(indices, features):
-            if len(cache) >= self.cache_size:
-                cache.pop(next(iter(cache)))
-            cache[idx.item()] = feat.detach()
-
     def process_modality(self, modal_name, indices):
-        cached_features, uncached_indices = self.get_cached_features(modal_name, indices)
-        
-        if uncached_indices:
-            if modal_name == 'image':
-                new_features = self.image_fcn(self.image_embedding(torch.tensor(uncached_indices).to(self.device)))
-            else:
-                new_features = self.text_fcn(self.text_embedding(torch.tensor(uncached_indices).to(self.device)))
-            
-            self.update_cache(modal_name, torch.tensor(uncached_indices), new_features)
-            cached_features.extend([f.detach() for f in new_features])
-            
-        return torch.stack(cached_features)
+        batch_size = indices.size(0)
+        if modal_name == 'image':
+            features = self.image_fcn(self.image_embedding(indices))
+        else:
+            features = self.text_fcn(self.text_embedding(indices))
+        return features
 
     def progressive_fusion(self, user_emb, item_emb, item_indices):
+        # Ensure all inputs have the same batch size
+        batch_size = user_emb.size(0)
         modal_importance = self.modality_router(torch.cat([user_emb, item_emb], dim=-1))
         modal_order = torch.argsort(modal_importance, dim=-1, descending=True)
         
+        # Initialize with item embeddings
         fused_features = item_emb
-        confidence = torch.zeros(item_emb.size(0)).to(self.device)
         
         for i in range(self.n_modalities):
             modal_idx = modal_order[:, i]
-            modal_name = self.available_modalities[modal_idx[0]]
+            modal_name = self.available_modalities[modal_idx[0].item()]
             
+            # Process current modality
             modal_features = self.process_modality(modal_name, item_indices)
-            fused_features = self.fusion_networks[i](torch.cat([fused_features, modal_features], dim=-1))
             
-            current_confidence = F.cosine_similarity(fused_features, item_emb)
-            confidence = torch.maximum(confidence, current_confidence)
+            # Ensure consistent dimensions for concatenation
+            fused_features = self.fusion_networks[i](
+                torch.cat([fused_features, modal_features], dim=-1)
+            )
             
-            if torch.all(confidence > 0.9):
-                break
-                
         return fused_features
 
     def forward(self, user, item):
@@ -153,47 +121,48 @@ class LIGHTMMREC(GeneralRecommender):
         pos_scores = torch.mul(user_emb, pos_item_emb).sum(dim=1)
         neg_scores = torch.mul(user_emb, neg_item_emb).sum(dim=1)
 
-        bpr_loss = -(pos_scores - neg_scores).sigmoid().log().mean()
-        reg_loss = self.reg_weight * (user_emb.norm(2).pow(2) + 
-                                    pos_item_emb.norm(2).pow(2) + 
-                                    neg_item_emb.norm(2).pow(2))
+        loss = -torch.log(torch.sigmoid(pos_scores - neg_scores)).mean()
+        reg_loss = self.reg_weight * (
+            user_emb.norm(2).pow(2) +
+            pos_item_emb.norm(2).pow(2) +
+            neg_item_emb.norm(2).pow(2)
+        )
 
-        return bpr_loss + reg_loss
+        return loss + reg_loss
 
     def full_sort_predict(self, interaction):
         user = interaction[0]
         user_emb = self.user_embedding(user)
         
-        # Initialize tensor to store all scores
-        scores = torch.zeros((user_emb.size(0), self.n_items)).to(self.device)
+        # Process items in batches
+        batch_size = 256  # Reduce batch size to manage memory
+        scores = []
         
-        # Process in batches to avoid memory issues
-        batch_size = 512  # Adjust this value based on available GPU memory
         for i in range(0, self.n_items, batch_size):
             end_idx = min(i + batch_size, self.n_items)
             batch_items = torch.arange(i, end_idx).to(self.device)
             
-            item_emb = self.item_id_embedding(batch_items)
+            # Get item embeddings for current batch
+            batch_item_emb = self.item_id_embedding(batch_items)
             
-            # Expand user embeddings to match current batch size
-            current_batch_size = end_idx - i
-            batch_user_emb = user_emb.unsqueeze(1).expand(-1, current_batch_size, -1)
-            batch_user_emb = batch_user_emb.reshape(-1, self.embedding_dim)
+            # Expand user embeddings to match batch size
+            batch_user_emb = user_emb.unsqueeze(1).expand(-1, end_idx - i, -1)
+            batch_item_emb = batch_item_emb.unsqueeze(0).expand(user_emb.size(0), -1, -1)
             
-            # Expand item embeddings
-            batch_item_emb = item_emb.unsqueeze(0).expand(user_emb.size(0), -1, -1)
-            batch_item_emb = batch_item_emb.reshape(-1, self.embedding_dim)
+            # Process each user-item pair in the batch
+            batch_scores = []
+            for j in range(batch_user_emb.size(0)):
+                user_j_emb = batch_user_emb[j]
+                item_j_emb = batch_item_emb[j]
+                fused_features = self.progressive_fusion(
+                    user_j_emb,
+                    item_j_emb,
+                    batch_items
+                )
+                score = torch.mul(user_j_emb, fused_features).sum(dim=-1)
+                batch_scores.append(score)
             
-            # Get fused features for current batch
-            fused_item_features = self.progressive_fusion(batch_user_emb, batch_item_emb, batch_items)
-            
-            # Calculate scores for current batch
-            batch_scores = torch.mul(
-                batch_user_emb,
-                fused_item_features
-            ).sum(dim=-1)
-            
-            # Store scores in the correct position
-            scores[:, i:end_idx] = batch_scores.view(user_emb.size(0), -1)
+            batch_scores = torch.stack(batch_scores)
+            scores.append(batch_scores)
         
-        return scores
+        return torch.cat(scores, dim=1)
