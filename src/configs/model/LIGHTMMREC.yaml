@@ -1,0 +1,23 @@
+# Model Configuration
+embedding_size: 64
+feat_embed_dim: 64
+n_mm_layers: 2
+n_layers: 2
+n_prototypes: 16
+dropout: 0.2
+temperature: 0.2
+ssl_temperature: 0.1
+
+# Loss Weights
+reg_weight: 1e-4
+ssl_weight: 0.1
+proto_reg: 0.01
+
+# Model Structure
+mm_fusion_mode: "attention"  # [attention, concat, mean]
+use_graph_attention: True
+use_prototypes: True
+use_interests: True
+cache_size: 1000
+
+
