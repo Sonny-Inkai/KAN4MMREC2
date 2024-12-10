@@ -119,7 +119,7 @@ class MMRECMODEL(GeneralRecommender):
         self.masked_adj = torch.sparse_coo_tensor(all_indices, all_values, self.norm_adj.shape).to(self.device)
 
     def forward(self):
-        h = self.item_id_embedding.weight
+        h = torch.cat((self.user_embedding.weight, self.item_id_embedding.weight), dim=0)
         for i in range(self.n_layers):
             h = torch.sparse.mm(self.mm_adj, h)
 
@@ -135,9 +135,10 @@ class MMRECMODEL(GeneralRecommender):
         image_feats = self.image_trs(self.image_embedding.weight)
         text_feats = self.text_trs(self.text_embedding.weight)
 
-        i_g_embeddings = i_g_embeddings + h + image_feats + text_feats
+        i_g_embeddings = i_g_embeddings + image_feats + text_feats
 
         return u_g_embeddings, i_g_embeddings
+
 
     def calculate_loss(self, interaction):
         users = interaction[0]
