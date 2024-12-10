@@ -75,9 +75,22 @@ class MMRECMODEL(GeneralRecommender):
         pos_i_g_embeddings = i_g_embeddings[pos_items]
         neg_i_g_embeddings = i_g_embeddings[neg_items]
 
+        # Check shapes
+        print(f'u_g_embeddings shape: {u_g_embeddings.shape}')
+        print(f'pos_i_g_embeddings shape: {pos_i_g_embeddings.shape}')
+        print(f'neg_i_g_embeddings shape: {neg_i_g_embeddings.shape}')
+
+        # Ensure embeddings are float tensors
+        u_g_embeddings = u_g_embeddings.float()
+        pos_i_g_embeddings = pos_i_g_embeddings.float()
+        neg_i_g_embeddings = neg_i_g_embeddings.float()
+
+        # Calculate loss
         batch_mf_loss = BPRLoss()(u_g_embeddings, pos_i_g_embeddings, neg_i_g_embeddings)
 
-        return batch_mf_loss + self.reg_weight * (u_g_embeddings.norm(2).pow(2) + pos_i_g_embeddings.norm(2).pow(2) + neg_i_g_embeddings.norm(2).pow(2))
+        return batch_mf_loss + self.reg_weight * (u_g_embeddings.norm(2).pow(2) +
+                                                    pos_i_g_embeddings.norm(2).pow(2) +
+                                                    neg_i_g_embeddings.norm(2).pow(2))
 
     def full_sort_predict(self, interaction):
         user = interaction[0]
