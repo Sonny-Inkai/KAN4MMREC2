@@ -29,3 +29,4 @@ knn_k: 10
 
 n_mm_layers: 1
 cl_weight: 2.0
+mm_image_weight: 0.5

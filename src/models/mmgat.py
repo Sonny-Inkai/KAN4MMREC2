@@ -1,109 +1,117 @@
 # coding: utf-8
+import os
+import random
+import numpy as np
+import scipy.sparse as sp
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import dgl
-import dgl.nn as dglnn
-import os
-import numpy as np
-import scipy.sparse as sp
+from torch_geometric.nn import GATConv
 from common.abstract_recommender import GeneralRecommender
-from common.loss import BPRLoss, EmbLoss
+from common.loss import BPRLoss, EmbLoss, L2Loss
+from utils.utils import build_sim, compute_normalized_laplacian
 
 class MMGAT(GeneralRecommender):
     def __init__(self, config, dataset):
         super(MMGAT, self).__init__(config, dataset)
-
+        
         self.embedding_dim = config["embedding_size"]
         self.feat_embed_dim = config["feat_embed_dim"]
         self.n_layers = config["n_mm_layers"]
-        self.n_heads = config["n_heads"]
+        self.n_heads = 4  # Number of attention heads
         self.dropout = config["dropout"]
         self.knn_k = config["knn_k"]
         self.reg_weight = config["reg_weight"]
-        self.lambda_coeff = config["lambda_coeff"]
+        self.mm_image_weight = config["mm_image_weight"]
         
         self.n_nodes = self.n_users + self.n_items
         
         # Load dataset info
         self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
         self.norm_adj = self.get_norm_adj_mat().to(self.device)
-
+        
         # Embeddings
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
         self.item_id_embedding = nn.Embedding(self.n_items, self.embedding_dim)
         nn.init.xavier_uniform_(self.user_embedding.weight)
         nn.init.xavier_uniform_(self.item_id_embedding.weight)
-
-        # Modal processing
+        
+        # Modal features
         if self.v_feat is not None:
             self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
             self.image_trs = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
         if self.t_feat is not None:
             self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
             self.text_trs = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
-
-        # Graph attention layers
-        self.gat_layers = nn.ModuleList([
-            dglnn.GATConv(
-                self.feat_embed_dim, 
-                self.feat_embed_dim, 
-                self.n_heads,
-                feat_drop=self.dropout,
-                attn_drop=self.dropout,
-                residual=True,
-                activation=F.leaky_relu
-            ) for _ in range(self.n_layers)
-        ])
-
-        self.modal_weight = nn.Parameter(torch.Tensor([0.5, 0.5]))
-        self.softmax = nn.Softmax(dim=0)
-        
-        # Build modal graph
-        self.mm_graph = None
-        self.build_modal_graph()
-
-    def build_modal_graph(self):
-        # Create DGL graph for modal processing
-        if self.v_feat is not None:
-            image_feats = self.image_trs(self.image_embedding.weight)
-            image_sim = F.cosine_similarity(image_feats.unsqueeze(1), image_feats.unsqueeze(0), dim=2)
-            image_adj = torch.zeros_like(image_sim)
-            topk_values, topk_indices = torch.topk(image_sim, self.knn_k, dim=1)
-            image_adj.scatter_(1, topk_indices, 1)
-            src_i, dst_i = torch.nonzero(image_adj, as_tuple=True)
             
-            if self.t_feat is not None:
-                text_feats = self.text_trs(self.text_embedding.weight)
-                text_sim = F.cosine_similarity(text_feats.unsqueeze(1), text_feats.unsqueeze(0), dim=2)
-                text_adj = torch.zeros_like(text_sim)
-                topk_values, topk_indices = torch.topk(text_sim, self.knn_k, dim=1)
-                text_adj.scatter_(1, topk_indices, 1)
-                src_t, dst_t = torch.nonzero(text_adj, as_tuple=True)
-                
-                # Combine modalities
-                weight = self.softmax(self.modal_weight)
-                src = torch.cat([src_i, src_t])
-                dst = torch.cat([dst_i, dst_t])
-                self.mm_graph = dgl.graph((src, dst), num_nodes=self.n_items).to(self.device)
-            else:
-                self.mm_graph = dgl.graph((src_i, dst_i), num_nodes=self.n_items).to(self.device)
-        else:
-            text_feats = self.text_trs(self.text_embedding.weight)
-            text_sim = F.cosine_similarity(text_feats.unsqueeze(1), text_feats.unsqueeze(0), dim=2)
-            text_adj = torch.zeros_like(text_sim)
-            topk_values, topk_indices = torch.topk(text_sim, self.knn_k, dim=1)
-            text_adj.scatter_(1, topk_indices, 1)
-            src_t, dst_t = torch.nonzero(text_adj, as_tuple=True)
-            self.mm_graph = dgl.graph((src_t, dst_t), num_nodes=self.n_items).to(self.device)
+        # Graph Attention layers for multimodal fusion
+        self.gat_layers = nn.ModuleList()
+        for _ in range(self.n_layers):
+            self.gat_layers.append(
+                GATConv(
+                    self.feat_embed_dim, 
+                    self.feat_embed_dim, 
+                    heads=self.n_heads,
+                    dropout=self.dropout,
+                    concat=False
+                )
+            )
+            
+        # Fusion layer
+        self.fusion_layer = nn.Linear(self.feat_embed_dim * 2, self.feat_embed_dim)
+        
+        # Initialize modal adjacency
+        self._init_modal_adj()
+        
+    def _init_modal_adj(self):
+
+            
+        if self.v_feat is not None:
+            indices, image_adj = self.get_knn_adj_mat(self.image_embedding.weight.detach())
+            self.mm_adj = image_adj
+        if self.t_feat is not None:
+            indices, text_adj = self.get_knn_adj_mat(self.text_embedding.weight.detach())
+            self.mm_adj = text_adj
+        if self.v_feat is not None and self.t_feat is not None:
+            self.mm_adj = (
+                self.mm_image_weight * image_adj
+                + (1.0 - self.mm_image_weight) * text_adj
+            )
+            
+        torch.save(self.mm_adj, mm_adj_file)
+        
+    def get_knn_adj_mat(self, mm_embeddings):
+        context_norm = mm_embeddings.div(
+            torch.norm(mm_embeddings, p=2, dim=-1, keepdim=True)
+        )
+        sim = torch.mm(context_norm, context_norm.transpose(1, 0))
+        _, knn_ind = torch.topk(sim, self.knn_k, dim=-1)
+        adj_size = sim.size()
+        del sim
+        
+        indices0 = torch.arange(knn_ind.shape[0]).to(self.device)
+        indices0 = torch.unsqueeze(indices0, 1)
+        indices0 = indices0.expand(-1, self.knn_k)
+        indices = torch.stack((torch.flatten(indices0), torch.flatten(knn_ind)), 0)
+        
+        return indices, self.compute_normalized_laplacian(indices, adj_size)
+
+    def compute_normalized_laplacian(self, indices, adj_size):
+        adj = torch.sparse.FloatTensor(indices, torch.ones_like(indices[0]), adj_size)
+        row_sum = 1e-7 + torch.sparse.sum(adj, -1).to_dense()
+        r_inv_sqrt = torch.pow(row_sum, -0.5)
+        rows_inv_sqrt = r_inv_sqrt[indices[0]]
+        cols_inv_sqrt = r_inv_sqrt[indices[1]]
+        values = rows_inv_sqrt * cols_inv_sqrt
+        return torch.sparse.FloatTensor(indices, values, adj_size)
 
     def get_norm_adj_mat(self):
-        A = sp.dok_matrix((self.n_nodes, self.n_nodes), dtype=np.float32)
+        A = sp.dok_matrix((self.n_users + self.n_items, self.n_users + self.n_items), dtype=np.float32)
         inter_M = self.interaction_matrix
         inter_M_t = self.interaction_matrix.transpose()
         data_dict = dict(zip(zip(inter_M.row, inter_M.col + self.n_users), [1] * inter_M.nnz))
         data_dict.update(dict(zip(zip(inter_M_t.row + self.n_users, inter_M_t.col), [1] * inter_M_t.nnz)))
-        for key, value in data_dict.items():
+        for key, value in data_dict.items:
             A[key] = value
         
         sumArr = (A > 0).sum(axis=1)
@@ -114,27 +122,31 @@ class MMGAT(GeneralRecommender):
         L = sp.coo_matrix(L)
         indices = torch.LongTensor(np.array([L.row, L.col]))
         values = torch.FloatTensor(L.data)
-        return torch.sparse_coo_tensor(indices, values, torch.Size((self.n_nodes, self.n_nodes)))
-
+        return torch.sparse.FloatTensor(indices, values, torch.Size((self.n_nodes, self.n_nodes)))
+        
     def forward(self, adj):
-        # Multimodal feature learning
+        # Process multimodal features
         if self.v_feat is not None:
-            item_feats = self.image_trs(self.image_embedding.weight)
+            image_feats = self.image_trs(self.image_embedding.weight)
         if self.t_feat is not None:
-            if self.v_feat is not None:
-                text_feats = self.text_trs(self.text_embedding.weight)
-                weight = self.softmax(self.modal_weight)
-                item_feats = weight[0] * item_feats + weight[1] * text_feats
-            else:
-                item_feats = self.text_trs(self.text_embedding.weight)
-
-        # Graph attention on item features
-        h = item_feats
+            text_feats = self.text_trs(self.text_embedding.weight)
+            
+        # Multimodal fusion
+        if self.v_feat is not None and self.t_feat is not None:
+            modal_feats = torch.cat([image_feats, text_feats], dim=1)
+            item_feats = self.fusion_layer(modal_feats)
+        else:
+            item_feats = image_feats if self.v_feat is not None else text_feats
+            
+        # Apply GAT layers
+        edge_index = self.mm_adj._indices()
+        x = item_feats
         for gat_layer in self.gat_layers:
-            h = gat_layer(self.mm_graph, h).mean(1)
-            h = F.dropout(h, self.dropout, training=self.training)
-
-        # User-Item graph learning
+            x = gat_layer(x, edge_index)
+            x = F.relu(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+            
+        # User-Item Graph Learning
         ego_embeddings = torch.cat((self.user_embedding.weight, self.item_id_embedding.weight), dim=0)
         all_embeddings = [ego_embeddings]
         
@@ -144,13 +156,12 @@ class MMGAT(GeneralRecommender):
             
         all_embeddings = torch.stack(all_embeddings, dim=1)
         all_embeddings = torch.mean(all_embeddings, dim=1)
-        u_g_embeddings, i_g_embeddings = torch.split(all_embeddings, [self.n_users, self.n_items], dim=0)
         
-        # Combine item embeddings with multimodal features
-        i_g_embeddings = i_g_embeddings + F.normalize(h, p=2, dim=1)
+        u_g_embeddings, i_g_embeddings = torch.split(all_embeddings, [self.n_users, self.n_items], dim=0)
+        i_g_embeddings = i_g_embeddings + F.normalize(x, p=2, dim=1)
         
         return u_g_embeddings, i_g_embeddings
-
+        
     def calculate_loss(self, interaction):
         users = interaction[0]
         pos_items = interaction[1]
@@ -165,23 +176,20 @@ class MMGAT(GeneralRecommender):
         # BPR Loss
         pos_scores = torch.sum(torch.mul(u_embeddings, pos_embeddings), dim=1)
         neg_scores = torch.sum(torch.mul(u_embeddings, neg_embeddings), dim=1)
-        
         mf_loss = -torch.mean(torch.log(torch.sigmoid(pos_scores - neg_scores)))
         
-        # Regularization Loss
+        # L2 regularization
         reg_loss = self.reg_weight * (
-            torch.norm(u_embeddings) ** 2 +
-            torch.norm(pos_embeddings) ** 2 +
-            torch.norm(neg_embeddings) ** 2
-        ) / (2 * len(users))
+            torch.norm(u_embeddings) +
+            torch.norm(pos_embeddings) +
+            torch.norm(neg_embeddings)
+        )
         
         return mf_loss + reg_loss
 
     def full_sort_predict(self, interaction):
         user = interaction[0]
-        
         u_embeddings, i_embeddings = self.forward(self.norm_adj)
         u_embeddings = u_embeddings[user]
-        
         scores = torch.matmul(u_embeddings, i_embeddings.transpose(0, 1))
         return scores
