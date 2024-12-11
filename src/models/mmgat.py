@@ -68,16 +68,16 @@ class MMGAT(GeneralRecommender):
 
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
         self.item_id_embedding = nn.Embedding(self.n_items, self.embedding_dim)
-        xavier_normal_(self.user_embedding.weight)
-        xavier_normal_(self.item_id_embedding.weight)
+        nn.init.xavier_normal_(self.user_embedding.weight)
+        nn.init.xavier_normal_(self.item_id_embedding.weight)
 
         self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
         self.image_trs = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
-        xavier_normal_(self.image_trs.weight)
+        nn.init.xavier_normal_(self.image_trs.weight)
 
         self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
         self.text_trs = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
-        xavier_normal_(self.text_trs.weight)
+        nn.init.xavier_normal_(self.text_trs.weight)
 
         self.mm_fusion = MultiModalFusion(self.embedding_dim, self.feat_embed_dim)
 

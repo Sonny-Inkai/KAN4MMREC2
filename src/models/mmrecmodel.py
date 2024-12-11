@@ -5,6 +5,8 @@ from torch.nn.init import xavier_normal_
 from common.abstract_recommender import GeneralRecommender
 from common.loss import BPRLoss, EmbLoss
 
+
+# recall@5: 0.0003
 class MultiModalFusion(nn.Module):
     def __init__(self, embedding_dim, feat_embed_dim):
         super(MultiModalFusion, self).__init__()
