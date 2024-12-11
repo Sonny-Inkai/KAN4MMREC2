@@ -32,24 +32,26 @@ class MMGAT(GeneralRecommender):
         self.knn_k = config["knn_k"]
         self.reg_weight = config["reg_weight"]
         self.mm_image_weight = config["mm_image_weight"]
-        self.batch_size = 512  # Batch size for similarity computation
+        self.batch_size = 256  # Reduced batch size
         self.n_nodes = self.n_users + self.n_items
         
-        self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
-        self.norm_adj = self.get_norm_adj_mat().to(self.device)
-        
-        # Embeddings
-        self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
-        self.item_id_embedding = nn.Embedding(self.n_items, self.embedding_dim)
+        # Initialize embeddings
+        self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim).to(self.device)
+        self.item_id_embedding = nn.Embedding(self.n_items, self.embedding_dim).to(self.device)
         nn.init.normal_(self.user_embedding.weight, std=0.1)
         nn.init.normal_(self.item_id_embedding.weight, std=0.1)
+
+        # Load dataset info
+        self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
         
         # Modal feature processing
         if self.v_feat is not None:
+            self.v_feat = torch.FloatTensor(self.v_feat).to(self.device)
             self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
             self.image_trs = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
             
         if self.t_feat is not None:
+            self.t_feat = torch.FloatTensor(self.t_feat).to(self.device)
             self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
             self.text_trs = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
 
@@ -66,105 +68,105 @@ class MMGAT(GeneralRecommender):
             nn.Dropout(self.dropout)
         )
         
-        # Move to device
+        # Move model to device
         self.to(self.device)
+        
+        # Initialize adjacency matrices
+        self.norm_adj = self.get_norm_adj_mat().to(self.device)
         self._init_modal_adj()
+
+    def get_norm_adj_mat(self):
+        adj_mat = sp.dok_matrix((self.n_nodes, self.n_nodes), dtype=np.float32)
+        inter_M = self.interaction_matrix
+        inter_M_t = self.interaction_matrix.transpose()
+        
+        data_dict = dict(zip(zip(inter_M.row, inter_M.col + self.n_users), [1] * inter_M.nnz))
+        data_dict.update(dict(zip(zip(inter_M_t.row + self.n_users, inter_M_t.col), [1] * inter_M_t.nnz)))
+        
+        for key, value in data_dict.items():
+            adj_mat[key] = value
+            
+        # Normalize adjacency matrix
+        row_sum = np.array(adj_mat.sum(axis=1))
+        d_inv = np.power(row_sum + 1e-7, -0.5).flatten()
+        d_mat = sp.diags(d_inv)
+        
+        norm_adj = d_mat.dot(adj_mat).dot(d_mat)
+        norm_adj = norm_adj.tocoo()
+        
+        # Convert to torch sparse tensor
+        indices = np.vstack((norm_adj.row, norm_adj.col))
+        indices = torch.LongTensor(indices)
+        values = torch.FloatTensor(norm_adj.data)
+        
+        return torch.sparse_coo_tensor(indices, values, 
+                                     (self.n_nodes, self.n_nodes))
 
     def compute_similarity_batched(self, embeddings):
         n_items = embeddings.size(0)
+        device = embeddings.device
         indices_list = []
         values_list = []
         
+        row_indices = torch.arange(n_items, device=device)
+        
         for i in range(0, n_items, self.batch_size):
-            end_idx = min(i + self.batch_size, n_items)
-            batch_embeddings = embeddings[i:end_idx]
+            batch_end = min(i + self.batch_size, n_items)
+            batch_emb = embeddings[i:batch_end]
             
-            # Compute similarity for current batch
-            sim = F.cosine_similarity(
-                batch_embeddings.unsqueeze(1),
-                embeddings.unsqueeze(0),
-                dim=2
-            )
+            # Compute similarity
+            sim = torch.matmul(batch_emb, embeddings.t())
             
-            # Get top-k for current batch
-            topk_values, topk_indices = torch.topk(sim, self.knn_k, dim=1)
+            # Get top-k
+            topk_values, topk_indices = torch.topk(sim, self.knn_k)
             
-            # Create indices for current batch
-            batch_size = end_idx - i
-            row_indices = torch.arange(i, end_idx).view(-1, 1).expand(-1, self.knn_k)
+            # Create indices
+            batch_rows = row_indices[i:batch_end].view(-1, 1).expand(-1, self.knn_k)
             
-            # Add to lists
-            indices_list.append(torch.stack([row_indices.flatten(), topk_indices.flatten()]))
-            values_list.append(topk_values.flatten())
+            # Store results
+            indices_list.append(torch.stack([batch_rows.reshape(-1), 
+                                          topk_indices.reshape(-1)]))
+            values_list.append(topk_values.reshape(-1))
             
-            # Clear memory
+            # Clear cache
             del sim, topk_values, topk_indices
             torch.cuda.empty_cache()
         
-        # Combine all batches
+        # Combine results
         indices = torch.cat(indices_list, dim=1)
         values = torch.cat(values_list)
         
         return indices, values
 
     def _init_modal_adj(self):
-        if self.v_feat is not None:
-            image_feats = self.image_trs(self.image_embedding.weight)
-            v_indices, v_values = self.compute_similarity_batched(image_feats)
-            self.mm_adj = self.get_sparse_adj(v_indices, v_values, image_feats.size(0))
-            
-        if self.t_feat is not None:
-            text_feats = self.text_trs(self.text_embedding.weight)
-            t_indices, t_values = self.compute_similarity_batched(text_feats)
-            text_adj = self.get_sparse_adj(t_indices, t_values, text_feats.size(0))
-            
+        with torch.cuda.amp.autocast():
             if self.v_feat is not None:
-                self.mm_adj = self.mm_image_weight * self.mm_adj + (1 - self.mm_image_weight) * text_adj
-            else:
-                self.mm_adj = text_adj
-                
-        self.mm_edge_index = self.mm_adj._indices()
-        
-    def get_sparse_adj(self, indices, values, size):
-        adj = torch.sparse_coo_tensor(indices, values, (size, size))
-        adj = self.normalize_adj(adj)
-        return adj.to(self.device)
-        
-    def normalize_adj(self, adj):
-        row_sum = torch.sparse.sum(adj, dim=1).to_dense()
-        d_inv_sqrt = torch.pow(row_sum + 1e-7, -0.5)
-        d_mat_inv_sqrt = torch.diag(d_inv_sqrt)
-        return torch.sparse.mm(torch.sparse.mm(d_mat_inv_sqrt, adj), d_mat_inv_sqrt)
-
-    def get_norm_adj_mat(self):
-        A = sp.dok_matrix((self.n_nodes, self.n_nodes), dtype=np.float32)
-        inter_M = self.interaction_matrix
-        inter_M_t = self.interaction_matrix.transpose()
-        data_dict = dict(zip(zip(inter_M.row, inter_M.col + self.n_users), [1] * inter_M.nnz))
-        data_dict.update(dict(zip(zip(inter_M_t.row + self.n_users, inter_M_t.col), [1] * inter_M_t.nnz)))
-        
-        for key, value in data_dict.items():
-            A[key] = value
+                image_feats = self.image_trs(self.image_embedding.weight)
+                v_indices, v_values = self.compute_similarity_batched(image_feats)
+                image_adj = torch.sparse_coo_tensor(v_indices, v_values, 
+                                                  (self.n_items, self.n_items))
+                self.mm_adj = image_adj.to(self.device)
             
-        sumArr = (A > 0).sum(axis=1)
-        diag = np.array(sumArr.flatten())[0] + 1e-7
-        diag = np.power(diag, -0.5)
-        D = sp.diags(diag)
-        L = D * A * D
-        L = sp.coo_matrix(L)
-        return torch.sparse_coo_tensor(
-            torch.LongTensor([L.row, L.col]),
-            torch.FloatTensor(L.data),
-            torch.Size([self.n_nodes, self.n_nodes])
-        )
-        
+            if self.t_feat is not None:
+                text_feats = self.text_trs(self.text_embedding.weight)
+                t_indices, t_values = self.compute_similarity_batched(text_feats)
+                text_adj = torch.sparse_coo_tensor(t_indices, t_values, 
+                                                 (self.n_items, self.n_items))
+                
+                if self.v_feat is not None:
+                    self.mm_adj = (self.mm_image_weight * self.mm_adj + 
+                                 (1 - self.mm_image_weight) * text_adj)
+                else:
+                    self.mm_adj = text_adj.to(self.device)
+            
+            self.mm_edge_index = self.mm_adj._indices()
+
     def forward(self, adj):
-        # Process modal features
         if self.v_feat is not None:
             image_feats = self.image_trs(self.image_embedding.weight)
         if self.t_feat is not None:
             text_feats = self.text_trs(self.text_embedding.weight)
-            
+        
         # Modal fusion
         if self.v_feat is not None and self.t_feat is not None:
             modal_feats = torch.cat([image_feats, text_feats], dim=1)
@@ -177,23 +179,25 @@ class MMGAT(GeneralRecommender):
         for layer in self.gat_layers:
             x = layer(x, self.mm_edge_index)
             x = F.dropout(x, p=self.dropout, training=self.training)
-            
+        
         # User-Item interaction
-        ego_embeddings = torch.cat((self.user_embedding.weight, self.item_id_embedding.weight), dim=0)
+        ego_embeddings = torch.cat([self.user_embedding.weight, 
+                                  self.item_id_embedding.weight], dim=0)
         all_embeddings = [ego_embeddings]
         
-        # Light graph convolution
+        # Graph convolution
+        h = ego_embeddings
         for _ in range(self.n_layers):
-            ego_embeddings = torch.sparse.mm(adj, ego_embeddings)
-            all_embeddings.append(ego_embeddings)
-            
+            h = torch.sparse.mm(adj, h)
+            all_embeddings.append(h)
+        
         all_embeddings = torch.stack(all_embeddings, dim=1)
         all_embeddings = torch.mean(all_embeddings, dim=1)
         
-        u_g_embeddings, i_g_embeddings = torch.split(all_embeddings, [self.n_users, self.n_items], dim=0)
-        i_g_embeddings = i_g_embeddings + x
+        u_embeddings, i_embeddings = torch.split(all_embeddings, 
+                                               [self.n_users, self.n_items])
         
-        return u_g_embeddings, i_g_embeddings
+        return u_embeddings, i_embeddings + x
 
     def calculate_loss(self, interaction):
         users = interaction[0]
