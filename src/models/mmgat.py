@@ -165,7 +165,7 @@ class MMGAT(GeneralRecommender):
             image_feats = self.image_projection(self.image_embedding.weight)
         if self.t_feat is not None:
             text_feats = self.text_projection(self.text_embedding.weight)
-        
+
         # Modal fusion with attention
         if self.v_feat is not None and self.t_feat is not None:
             concat_feats = torch.cat([image_feats, text_feats], dim=1)
@@ -174,31 +174,34 @@ class MMGAT(GeneralRecommender):
                         attention[:, 1].unsqueeze(1) * text_feats
         else:
             item_feats = image_feats if self.v_feat is not None else text_feats
-            
+
         # Dual-channel GAT
         x = item_feats
         for gat_layer in self.gat_layers:
+            # Debugging: Print shapes of inputs
+            print(f"Input to GAT Layer: {x.shape}, Struct Edge Index: {self.norm_adj._indices().shape}, Modal Edge Index: {self.mm_edge_index.shape}")
+            
             x = gat_layer(x, self.norm_adj._indices(), self.mm_edge_index)
             x = F.dropout(x, p=self.dropout, training=self.training)
-            
+
         # User-Item graph convolution
         ego_embeddings = torch.cat([self.user_embedding.weight, 
-                                  self.item_id_embedding.weight], dim=0)
+                                    self.item_id_embedding.weight], dim=0)
         all_embeddings = [ego_embeddings]
-        
+
         for _ in range(self.n_layers):
             ego_embeddings = torch.sparse.mm(self.norm_adj, ego_embeddings)
             all_embeddings.append(ego_embeddings)
-            
+
         all_embeddings = torch.stack(all_embeddings, dim=1)
         all_embeddings = torch.mean(all_embeddings, dim=1)
-        
+
         u_g_embeddings, i_g_embeddings = torch.split(all_embeddings, 
-                                                   [self.n_users, self.n_items])
-        
+                                                    [self.n_users, self.n_items])
+
         # Final prediction
         item_embeddings = i_g_embeddings + self.predictor(x)
-        
+
         return u_g_embeddings, item_embeddings
 
     def calculate_loss(self, interaction):
