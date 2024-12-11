@@ -75,7 +75,7 @@ class MMGAT(GeneralRecommender):
                 MMGATLayer(self.feat_embed_dim) for _ in range(self.n_layers)
             ])
         
-        self.dropout = nn.Dropout(config['dropout'])
+        self.dropout = config['dropout']
         self.to(self.device)
         self.build_graph()
 
