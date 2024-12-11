@@ -34,7 +34,6 @@ class MMGAT(GeneralRecommender):
     def __init__(self, config, dataset):
         super(MMGAT, self).__init__(config, dataset)
         
-        # Basic configurations
         self.embedding_dim = config["embedding_size"]
         self.feat_embed_dim = config["feat_embed_dim"]
         self.n_layers = config["n_mm_layers"]
@@ -49,16 +48,18 @@ class MMGAT(GeneralRecommender):
         
         # Load dataset info
         self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
-        self.norm_adj = self.get_norm_adj_mat().to(self.device)
         
         # Initialize embeddings
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
         self.item_id_embedding = nn.Embedding(self.n_items, self.embedding_dim)
+        self.user_embedding = self.user_embedding.to(self.device)
+        self.item_id_embedding = self.item_id_embedding.to(self.device)
         nn.init.xavier_uniform_(self.user_embedding.weight)
         nn.init.xavier_uniform_(self.item_id_embedding.weight)
 
         # Modal feature processing
         if self.v_feat is not None:
+            self.v_feat = self.v_feat.to(self.device)
             self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
             self.image_projection = nn.Sequential(
                 nn.Linear(self.v_feat.shape[1], self.feat_embed_dim),
@@ -66,9 +67,10 @@ class MMGAT(GeneralRecommender):
                 nn.PReLU(),
                 nn.Dropout(0.2),
                 nn.Linear(self.feat_embed_dim, self.feat_embed_dim)
-            )
+            ).to(self.device)
             
         if self.t_feat is not None:
+            self.t_feat = self.t_feat.to(self.device)
             self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
             self.text_projection = nn.Sequential(
                 nn.Linear(self.t_feat.shape[1], self.feat_embed_dim),
@@ -76,13 +78,13 @@ class MMGAT(GeneralRecommender):
                 nn.PReLU(),
                 nn.Dropout(0.2),
                 nn.Linear(self.feat_embed_dim, self.feat_embed_dim)
-            )
+            ).to(self.device)
 
         # Cross-modal fusion network
         self.modal_fusion = nn.ModuleList([
             CrossModalGATLayer(self.feat_embed_dim, self.feat_embed_dim, self.n_heads)
             for _ in range(self.n_layers)
-        ])
+        ]).to(self.device)
         
         # Modal attention
         self.modal_attention = nn.Sequential(
@@ -91,40 +93,27 @@ class MMGAT(GeneralRecommender):
             nn.PReLU(),
             nn.Linear(self.feat_embed_dim, 2),
             nn.Softmax(dim=-1)
-        )
+        ).to(self.device)
         
         # User-Item interaction layers
         self.ui_layers = nn.ModuleList([
             GATv2Conv(self.embedding_dim, self.embedding_dim // self.n_heads, 
                      heads=self.n_heads, concat=True)
             for _ in range(self.n_layers)
-        ])
+        ]).to(self.device)
         
         self.final_projection = nn.Sequential(
             nn.Linear(self.embedding_dim * 2, self.embedding_dim),
             nn.LayerNorm(self.embedding_dim),
             nn.PReLU()
-        )
+        ).to(self.device)
+        
+        # Get normalized adjacency matrix
+        self.norm_adj = self.get_norm_adj_mat().to(self.device)
         
         # Initialize modal adjacency
         self._init_modal_adj()
         
-    def _init_modal_adj(self):
-        if self.v_feat is not None:
-            image_feats = self.image_projection(self.image_embedding.weight)
-            indices, image_adj = self.get_knn_adj_mat(image_feats)
-            self.mm_adj = image_adj
-            
-        if self.t_feat is not None:
-            text_feats = self.text_projection(self.text_embedding.weight)
-            indices, text_adj = self.get_knn_adj_mat(text_feats)
-            self.mm_adj = text_adj
-            
-        if self.v_feat is not None and self.t_feat is not None:
-            self.mm_adj = self.mm_image_weight * image_adj + (1.0 - self.mm_image_weight) * text_adj
-        
-        self.mm_edge_index = self.mm_adj._indices()
-
     def get_norm_adj_mat(self):
         A = sp.dok_matrix((self.n_users + self.n_items, self.n_users + self.n_items), dtype=np.float32)
         inter_M = self.interaction_matrix
@@ -143,10 +132,26 @@ class MMGAT(GeneralRecommender):
         L = sp.coo_matrix(L)
         row = L.row
         col = L.col
-        i = torch.LongTensor(np.array([row, col]))
-        data = torch.FloatTensor(L.data)
+        indices = torch.LongTensor(np.array([row, col]))
+        values = torch.FloatTensor(L.data)
         
-        return torch.sparse.FloatTensor(i, data, torch.Size((self.n_nodes, self.n_nodes)))
+        return torch.sparse_coo_tensor(indices, values, torch.Size((self.n_nodes, self.n_nodes)))
+        
+    def _init_modal_adj(self):
+        if self.v_feat is not None:
+            image_feats = self.image_projection(self.image_embedding.weight)
+            indices, image_adj = self.get_knn_adj_mat(image_feats)
+            self.mm_adj = image_adj.to(self.device)
+            
+        if self.t_feat is not None:
+            text_feats = self.text_projection(self.text_embedding.weight)
+            indices, text_adj = self.get_knn_adj_mat(text_feats)
+            self.mm_adj = text_adj.to(self.device)
+            
+        if self.v_feat is not None and self.t_feat is not None:
+            self.mm_adj = (self.mm_image_weight * image_adj + (1.0 - self.mm_image_weight) * text_adj).to(self.device)
+        
+        self.mm_edge_index = self.mm_adj._indices()
         
     def get_knn_adj_mat(self, embeddings):
         sim = F.cosine_similarity(embeddings.unsqueeze(1), embeddings.unsqueeze(0), dim=2)
@@ -159,13 +164,13 @@ class MMGAT(GeneralRecommender):
         return indices, self.compute_normalized_laplacian(indices, adj.size(), values)
         
     def compute_normalized_laplacian(self, indices, size, values):
-        adj = torch.sparse.FloatTensor(indices, values, size)
+        adj = torch.sparse_coo_tensor(indices, values, size)
         row_sum = 1e-7 + torch.sparse.sum(adj, -1).to_dense()
         r_inv_sqrt = torch.pow(row_sum, -0.5)
         rows_inv_sqrt = r_inv_sqrt[indices[0]]
         cols_inv_sqrt = r_inv_sqrt[indices[1]]
         values = rows_inv_sqrt * values * cols_inv_sqrt
-        return torch.sparse.FloatTensor(indices, values, size)
+        return torch.sparse_coo_tensor(indices, values, size)
 
     def contrastive_loss(self, h1, h2):
         h1 = F.normalize(h1, p=2, dim=-1)
