@@ -44,7 +44,7 @@ class MMGAT(GeneralRecommender):
         self.embedding_dim = config["embedding_size"]
         self.feat_embed_dim = config["feat_embed_dim"]
         self.n_layers = config["n_mm_layers"]
-        self.temperature = config.get("temperature", 0.07)
+        self.temperature = config["temperature"]
         self.reg_weight = config["reg_weight"]
         self.n_nodes = self.n_users + self.n_items
         
