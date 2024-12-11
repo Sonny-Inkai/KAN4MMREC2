@@ -46,12 +46,22 @@ class MMGAT(GeneralRecommender):
         
         # Modal feature processing
         if self.v_feat is not None:
-            self.v_feat = torch.FloatTensor(self.v_feat).to(self.device)
+            # Ensure v_feat is converted correctly to a tensor on the right device
+            if isinstance(self.v_feat, np.ndarray):
+                self.v_feat = torch.tensor(self.v_feat, dtype=torch.float32, device=self.device)
+            else:
+                self.v_feat = self.v_feat.to(self.device)  # Assuming it's already a tensor
+            
             self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
             self.image_trs = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
             
         if self.t_feat is not None:
-            self.t_feat = torch.FloatTensor(self.t_feat).to(self.device)
+            # Ensure t_feat is converted correctly to a tensor on the right device
+            if isinstance(self.t_feat, np.ndarray):
+                self.t_feat = torch.tensor(self.t_feat, dtype=torch.float32, device=self.device)
+            else:
+                self.t_feat = self.t_feat.to(self.device)  # Assuming it's already a tensor
+            
             self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
             self.text_trs = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
 
@@ -74,6 +84,7 @@ class MMGAT(GeneralRecommender):
         # Initialize adjacency matrices
         self.norm_adj = self.get_norm_adj_mat().to(self.device)
         self._init_modal_adj()
+
 
     def get_norm_adj_mat(self):
         adj_mat = sp.dok_matrix((self.n_nodes, self.n_nodes), dtype=np.float32)
