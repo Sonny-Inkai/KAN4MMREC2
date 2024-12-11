@@ -150,7 +150,7 @@ class MMGAT(GeneralRecommender):
         contrastive_loss = 0.0
         if img_emb is not None and txt_emb is not None:
             pos_sim = F.cosine_similarity(img_emb[pos_items], txt_emb[pos_items])
-            contrastive_loss = -torch.mean(F.logsigmoid(pos_sim / self.temperature))
+            contrastive_loss = -torch.mean(F.logsigmoid(pos_sim / torch.Tensor(self.temperature)))
         
         # L2 regularization
         reg_loss = self.reg_weight * (
