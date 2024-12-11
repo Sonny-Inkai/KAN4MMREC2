@@ -49,7 +49,7 @@ class MMGAT(GeneralRecommender):
         
         # Load dataset info
         self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
-        self.norm_adj = self.get_knn_adj_mat().to(self.device)
+        self.norm_adj = self.get_norm_adj_mat().to(self.device)
         
         # Initialize embeddings
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
@@ -124,6 +124,43 @@ class MMGAT(GeneralRecommender):
             self.mm_adj = self.mm_image_weight * image_adj + (1.0 - self.mm_image_weight) * text_adj
         
         self.mm_edge_index = self.mm_adj._indices()
+
+    def get_norm_adj_mat(self):
+        A = sp.dok_matrix(
+            (self.n_users + self.n_items, self.n_users + self.n_items), dtype=np.float32
+        )
+        inter_M = self.interaction_matrix
+        inter_M_t = self.interaction_matrix.transpose()
+        data_dict = dict(
+            zip(zip(inter_M.row, inter_M.col + self.n_users), [1] * inter_M.nnz)
+        )
+        data_dict.update(
+            dict(
+                zip(
+                    zip(inter_M_t.row + self.n_users, inter_M_t.col),
+                    [1] * inter_M_t.nnz,
+                )
+            )
+        )
+        for key, value in data_dict.items():
+            A[key] = value
+        # norm adj matrix
+        sumArr = (A > 0).sum(axis=1)
+        # add epsilon to avoid Devide by zero Warning
+        diag = np.array(sumArr.flatten())[0] + 1e-7
+        diag = np.power(diag, -0.5)
+        D = sp.diags(diag)
+        L = D * A * D
+        # covert norm_adj matrix to tensor
+        L = sp.coo_matrix(L)
+        row = L.row
+        col = L.col
+        i = torch.LongTensor(np.array([row, col]))
+        data = torch.FloatTensor(L.data)
+
+        return torch.sparse.FloatTensor(
+            i, data, torch.Size((self.n_nodes, self.n_nodes))
+        )
         
     def get_knn_adj_mat(self, embeddings):
         sim = F.cosine_similarity(embeddings.unsqueeze(1), embeddings.unsqueeze(0), dim=2)
