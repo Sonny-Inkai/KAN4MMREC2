@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from common.abstract_recommender import GeneralRecommender
 
 class HybridAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads=4, dropout=0.1):
+    def __init__(self, embed_dim, num_heads=2, dropout=0.1):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
