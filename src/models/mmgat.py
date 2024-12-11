@@ -68,22 +68,46 @@ class MMGAT(GeneralRecommender):
 
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
         self.item_id_embedding = nn.Embedding(self.n_items, self.embedding_dim)
-        nn.init.xavier_normal_(self.user_embedding.weight)
-        nn.init.xavier_normal_(self.item_id_embedding.weight)
+        xavier_normal_(self.user_embedding.weight)
+        xavier_normal_(self.item_id_embedding.weight)
 
         self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
         self.image_trs = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
-        nn.init.xavier_normal_(self.image_trs.weight)
+        xavier_normal_(self.image_trs.weight)
 
         self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
         self.text_trs = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
-        nn.init.xavier_normal_(self.text_trs.weight)
+        xavier_normal_(self.text_trs.weight)
 
         self.mm_fusion = MultiModalFusion(self.embedding_dim, self.feat_embed_dim)
 
         self.graph_attention = GraphAttentionLayer(self.embedding_dim, self.embedding_dim, self.dropout, 0.2)
 
         self.fc_layers = nn.ModuleList([nn.Linear(self.embedding_dim, self.embedding_dim) for _ in range(self.n_ui_layers)])
+
+        # Initialize the norm_adj matrix
+        self.norm_adj = self._init_norm_adj()
+
+    def _init_norm_adj(self):
+        adj = self._build_adj()
+        norm_adj = self._normalize_adj(adj)
+        return norm_adj
+
+    def _build_adj(self):
+        adj = torch.zeros(self.n_users + self.n_items, self.n_users + self.n_items)
+        for user in range(self.n_users):
+            for item in range(self.n_items):
+                if self.inter_matrix[user, item] > 0:
+                    adj[user, item + self.n_users] = 1
+                    adj[item + self.n_users, user] = 1
+        return adj
+
+    def _normalize_adj(self, adj):
+        D = torch.sum(adj, dim=1)
+        D_inv = 1 / D
+        D_inv[D_inv == float('inf')] = 0
+        norm_adj = torch.diag(D_inv) @ adj
+        return norm_adj
 
     def forward(self):
         u_embeddings = self.user_embedding.weight
@@ -127,7 +151,6 @@ class MMGAT(GeneralRecommender):
 
         restore_user_e, restore_item_e = self.forward()
         u_embeddings = restore_user_e[user]
+        scores = torch.matmul(u_embeddings, restore_item_e.T)
 
-        # dot with all item embedding to accelerate
-        scores = torch.matmul(u_embeddings, restore_item_e.transpose(0, 1))
         return scores
