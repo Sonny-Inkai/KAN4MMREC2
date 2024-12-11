@@ -1,7 +1,7 @@
 # Hyperparameter configuration for MMRecModel
 
-embedding_size: 16
-feat_embed_dim: 16
+embedding_size: 64
+feat_embed_dim: 64
 
 # Number of layers for multimodal and user-item interactions
 n_layers: 2
