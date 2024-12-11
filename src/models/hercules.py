@@ -10,6 +10,8 @@ import torch.nn.functional as F
 from common.abstract_recommender import GeneralRecommender
 from common.loss import BPRLoss, EmbLoss
 
+
+#0.004
 class HERCULES(GeneralRecommender):
     def __init__(self, config, dataset):
         super(HERCULES, self).__init__(config, dataset)

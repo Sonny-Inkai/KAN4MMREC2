@@ -5,6 +5,7 @@ from torch_geometric.nn import GATConv, global_mean_pool
 from common.abstract_recommender import GeneralRecommender
 import numpy as np
 
+# 0.0008
 class HOPE(GeneralRecommender):
     def __init__(self, config, dataset):
         super(HOPE, self).__init__(config, dataset)
