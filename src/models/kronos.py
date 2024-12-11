@@ -13,7 +13,7 @@ from einops import rearrange, repeat
 
 from common.abstract_recommender import GeneralRecommender
 from common.loss import BPRLoss, EmbLoss
-
+# bug
 class KRONOS(GeneralRecommender):
     def __init__(self, config, dataset):
         super(KRONOS, self).__init__(config, dataset)
