@@ -85,6 +85,9 @@ class MMGAT(GeneralRecommender):
 
         self.fc_layers = nn.ModuleList([nn.Linear(self.embedding_dim, self.embedding_dim) for _ in range(self.n_ui_layers)])
 
+        # Initialize the inter_matrix attribute
+        self.inter_matrix = dataset.inter_matrix
+
         # Initialize the norm_adj matrix
         self.norm_adj = self._init_norm_adj()
 
