@@ -30,9 +30,6 @@ class MMGAT(GeneralRecommender):
         self.lambda_coeff = config["lambda_coeff"]
         self.temperature = 0.2
         
-        self.n_users = dataset.user_num
-        self.n_items = dataset.item_num
-        
         # Basic embeddings
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
         self.item_id_embedding = nn.Embedding(self.n_items, self.embedding_dim)
