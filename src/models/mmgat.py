@@ -8,27 +8,30 @@ import torch.nn.functional as F
 from common.abstract_recommender import GeneralRecommender
 from common.loss import BPRLoss, EmbLoss, L2Loss
 
-class SparseMMGATLayer(nn.Module):
+class MMGATConv(nn.Module):
     def __init__(self, in_dim, out_dim, dropout=0.1):
-        super(SparseMMGATLayer, self).__init__()
-        self.W = nn.Linear(in_dim, out_dim, bias=False)
-        self.a = nn.Parameter(torch.zeros(size=(1, 2*out_dim)))
-        nn.init.xavier_normal_(self.a.data)
+        super(MMGATConv, self).__init__()
+        self.linear = nn.Linear(in_dim, out_dim, bias=True)
+        self.att = nn.Parameter(torch.empty(size=(1, 2 * out_dim)))
+        nn.init.xavier_normal_(self.att.data)
         self.dropout = nn.Dropout(dropout)
         self.leakyrelu = nn.LeakyReLU(0.2)
-        self.norm = nn.LayerNorm(out_dim)
         
-    def forward(self, h, edge_index):
-        h = self.W(h)
-        edge_h = torch.cat([h[edge_index[0]], h[edge_index[1]]], dim=1)
-        edge_e = self.leakyrelu(torch.matmul(edge_h, self.a.T))
-        attention = torch.sparse_softmax(edge_e, edge_index[0])
-        attention = self.dropout(attention)
+    def forward(self, x, edge_index):
+        x = self.linear(x)
+        src, dst = edge_index
         
-        h_prime = torch.zeros_like(h)
-        h_prime.index_add_(0, edge_index[1], attention.unsqueeze(-1) * h[edge_index[0]])
+        # Compute attention coefficients
+        alpha = torch.cat([x[src], x[dst]], dim=1)
+        alpha = self.leakyrelu(alpha.matmul(self.att.t()))
+        alpha = self.dropout(F.softmax(alpha, dim=0))
         
-        return self.norm(h + h_prime)
+        # Aggregate neighbors
+        out = torch.zeros_like(x)
+        alpha = alpha.unsqueeze(-1)
+        out.index_add_(0, dst, alpha * x[src])
+        
+        return out + x
 
 class MMGAT(GeneralRecommender):
     def __init__(self, config, dataset):
@@ -55,20 +58,21 @@ class MMGAT(GeneralRecommender):
         if self.v_feat is not None:
             self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
             self.image_trs = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
-            self.image_gat = SparseMMGATLayer(self.feat_embed_dim, self.feat_embed_dim)
+            self.image_gat = MMGATConv(self.feat_embed_dim, self.feat_embed_dim)
             
         if self.t_feat is not None:
             self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
             self.text_trs = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
-            self.text_gat = SparseMMGATLayer(self.feat_embed_dim, self.feat_embed_dim)
+            self.text_gat = MMGATConv(self.feat_embed_dim, self.feat_embed_dim)
             
         self.fusion = nn.Sequential(
             nn.Linear(self.feat_embed_dim * 2, self.feat_embed_dim),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(self.feat_embed_dim, self.feat_embed_dim)
+            nn.Linear(self.feat_embed_dim, self.feat_embed_dim),
+            nn.LayerNorm(self.feat_embed_dim)
         )
-
+        
         self.to(self.device)
         self.build_graph_structure()
         
@@ -102,9 +106,9 @@ class MMGAT(GeneralRecommender):
 
     def build_knn_graph(self, features):
         norm_feat = F.normalize(features, p=2, dim=1)
-        dist = torch.mm(norm_feat, norm_feat.t())
+        sim = torch.mm(norm_feat, norm_feat.t())
         
-        _, indices = dist.topk(k=self.knn_k, dim=1)
+        _, indices = sim.topk(k=self.knn_k, dim=1)
         rows = torch.arange(features.size(0), device=self.device).view(-1, 1).expand_as(indices)
         edge_index = torch.stack([rows.reshape(-1), indices.reshape(-1)])
         return edge_index
