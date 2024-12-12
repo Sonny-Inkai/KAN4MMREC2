@@ -8,9 +8,9 @@ import scipy.sparse as sp
 from common.abstract_recommender import GeneralRecommender
 from common.loss import BPRLoss, EmbLoss
 
-class DualChannelRec(GeneralRecommender):
+class MMGAT(GeneralRecommender):
     def __init__(self, config, dataset):
-        super(DualChannelRec, self).__init__(config, dataset)
+        super(MMGAT, self).__init__(config, dataset)
         
         self.embedding_dim = config['embedding_size']
         self.feat_embed_dim = config['feat_embed_dim']
