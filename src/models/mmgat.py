@@ -1,5 +1,5 @@
 # coding: utf-8
-import os
+import os 
 import numpy as np
 import scipy.sparse as sp
 import torch
@@ -7,192 +7,204 @@ import torch.nn as nn
 import torch.nn.functional as F
 from common.abstract_recommender import GeneralRecommender
 
+class FeatureEncoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.1):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, output_dim),
+            nn.LayerNorm(output_dim)
+        )
+        
+    def forward(self, x):
+        return self.encoder(x)
+
+class ScaledDotProductAttention(nn.Module):
+    def __init__(self, temperature, dropout=0.1):
+        super().__init__()
+        self.temperature = temperature
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, q, k, v, mask=None):
+        attn = torch.matmul(q, k.transpose(-2, -1)) / self.temperature
+        if mask is not None:
+            attn = attn.masked_fill(mask == 0, -1e9)
+        attn = self.dropout(F.softmax(attn, dim=-1))
+        output = torch.matmul(attn, v)
+        return output
+
+class MultiModalAttention(nn.Module):
+    def __init__(self, dim, n_heads=4, dropout=0.1):
+        super().__init__()
+        self.n_heads = n_heads
+        self.dim = dim
+        self.head_dim = dim // n_heads
+        
+        self.w_q = nn.Linear(dim, dim)
+        self.w_k = nn.Linear(dim, dim)
+        self.w_v = nn.Linear(dim, dim)
+        self.fc = nn.Linear(dim, dim)
+        
+        self.attention = ScaledDotProductAttention(temperature=self.head_dim ** 0.5, dropout=dropout)
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(dim)
+        
+    def forward(self, q, k, v):
+        batch_size = q.size(0)
+        q = self.w_q(q).view(batch_size, -1, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.w_k(k).view(batch_size, -1, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.w_v(v).view(batch_size, -1, self.n_heads, self.head_dim).transpose(1, 2)
+        
+        output = self.attention(q, k, v)
+        output = output.transpose(1, 2).contiguous().view(batch_size, -1, self.dim)
+        output = self.dropout(self.fc(output))
+        output = self.norm(output)
+        return output
+
 class MMGAT(GeneralRecommender):
     def __init__(self, config, dataset):
         super(MMGAT, self).__init__(config, dataset)
         
         self.embedding_dim = config["embedding_size"]
         self.feat_embed_dim = config["feat_embed_dim"]
+        self.hidden_dim = self.feat_embed_dim * 2
         self.n_layers = config["n_mm_layers"]
-        self.n_ui_layers = config["n_ui_layers"]
         self.reg_weight = config["reg_weight"]
         self.dropout = config["dropout"]
-        self.build_item_graph = True
-        self.knn_k = config["knn_k"]
         
-        # Initialize embeddings
+        # Basic embeddings
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
         self.item_embedding = nn.Embedding(self.n_items, self.embedding_dim)
-        nn.init.xavier_normal_(self.user_embedding.weight)
-        nn.init.xavier_normal_(self.item_embedding.weight)
+        nn.init.xavier_normal_(self.user_embedding.weight, gain=1/2)
+        nn.init.xavier_normal_(self.item_embedding.weight, gain=1/2)
         
-        # Modal projections
+        # Modal encoders
         if self.v_feat is not None:
             self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
-            self.image_trs = nn.Sequential(
-                nn.Linear(self.v_feat.shape[1], self.hidden_dim),
-                nn.LayerNorm(self.hidden_dim),
-                nn.GELU(),
-                nn.Dropout(self.dropout),
-                nn.Linear(self.hidden_dim, self.feat_embed_dim)
-            )
+            self.image_encoder = FeatureEncoder(self.v_feat.shape[1], self.hidden_dim, self.feat_embed_dim, self.dropout)
             
         if self.t_feat is not None:
             self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
-            self.text_trs = nn.Sequential(
-                nn.Linear(self.t_feat.shape[1], self.hidden_dim),
-                nn.LayerNorm(self.hidden_dim),
-                nn.GELU(),
-                nn.Dropout(self.dropout),
-                nn.Linear(self.hidden_dim, self.feat_embed_dim)
-            )
+            self.text_encoder = FeatureEncoder(self.t_feat.shape[1], self.hidden_dim, self.feat_embed_dim, self.dropout)
         
+        # Multimodal attention
+        self.modal_attn = MultiModalAttention(self.feat_embed_dim, n_heads=4, dropout=self.dropout)
+        
+        # Graph structure
         self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
-        self.norm_adj = self.get_norm_adj_mat().to(self.device)
-        self.mm_adj = None
-        self.build_modal_graph()
+        self.adj_norm = self.build_adj_matrix().to(self.device)
         self.to(self.device)
 
-    def build_modal_graph(self):
-        if self.v_feat is not None and self.t_feat is not None:
-            v_feat = F.normalize(self.image_trs(self.image_embedding.weight), p=2, dim=1)
-            t_feat = F.normalize(self.text_trs(self.text_embedding.weight), p=2, dim=1)
-            
-            v_adj = self.build_knn_neighborhood(v_feat)
-            t_adj = self.build_knn_neighborhood(t_feat)
-            
-            self.mm_adj = 0.5 * (v_adj + t_adj)
-        elif self.v_feat is not None:
-            v_feat = F.normalize(self.image_trs(self.image_embedding.weight), p=2, dim=1)
-            self.mm_adj = self.build_knn_neighborhood(v_feat)
-        else:
-            t_feat = F.normalize(self.text_trs(self.text_embedding.weight), p=2, dim=1)
-            self.mm_adj = self.build_knn_neighborhood(t_feat)
-
-    def build_knn_neighborhood(self, features):
-        sim = torch.mm(features, features.t())
-        vals, cols = torch.topk(sim, k=self.knn_k, dim=1)
-        rows = torch.arange(features.size(0), device=self.device)
-        rows = rows.view(-1, 1).repeat(1, self.knn_k)
-        indices = torch.stack([rows.flatten(), cols.flatten()])
-        values = vals.flatten()
-        adj = torch.sparse_coo_tensor(indices, values, sim.size())
-        return self.compute_normalized_laplacian(adj)
-
-    def compute_normalized_laplacian(self, adj):
-        row_sum = 1e-7 + torch.sparse.sum(adj, dim=1).to_dense()
-        r_inv_sqrt = torch.pow(row_sum, -0.5)
-        values = adj._values()
-        indices = adj._indices()
-        norm_values = values * r_inv_sqrt[indices[0]] * r_inv_sqrt[indices[1]]
-        return torch.sparse_coo_tensor(indices, norm_values, adj.size())
-
-    def get_norm_adj_mat(self):
-        adj_mat = sp.dok_matrix((self.n_users + self.n_items, self.n_users + self.n_items), dtype=np.float32)
-        adj_mat = adj_mat.tolil()
+    def build_adj_matrix(self):
+        # Build normalized adjacency matrix
+        adj = sp.dok_matrix((self.n_users + self.n_items, self.n_users + self.n_items), dtype=np.float32)
+        adj = adj.tolil()
         R = self.interaction_matrix.tolil()
-        adj_mat[:self.n_users, self.n_users:] = R
-        adj_mat[self.n_users:, :self.n_users] = R.T
-        adj_mat = adj_mat.todok()
+        adj[:self.n_users, self.n_users:] = R
+        adj[self.n_users:, :self.n_users] = R.T
+        adj = adj.todok()
+        
+        # Symmetric normalization
+        rowsum = np.array(adj.sum(axis=1))
+        degree_inv = np.power(rowsum + 1e-9, -0.5).flatten()
+        degree_mat_inv = sp.diags(degree_inv)
+        norm_adj = degree_mat_inv.dot(adj).dot(degree_mat_inv)
+        
+        # Convert to sparse tensor
+        norm_adj = norm_adj.tocoo()
+        indices = torch.LongTensor([norm_adj.row, norm_adj.col])
+        values = torch.FloatTensor(norm_adj.data)
+        return torch.sparse_coo_tensor(indices, values, norm_adj.shape)
 
-        rowsum = np.array(adj_mat.sum(axis=1))
-        d_inv = np.power(rowsum + 1e-7, -0.5).flatten()
-        d_mat = sp.diags(d_inv)
-        norm_adj = d_mat.dot(adj_mat).dot(d_mat)
-
-        coo = norm_adj.tocoo()
-        i = torch.LongTensor([coo.row, coo.col])
-        v = torch.FloatTensor(coo.data)
-        return torch.sparse_coo_tensor(i, v, torch.Size(coo.shape))
-
-    def message_dropout(self, x, adj):
+    def message_dropout(self, adj):
         if not self.training or self.dropout == 0:
-            return torch.sparse.mm(adj, x)
+            return adj
             
-        mask = torch.bernoulli(torch.full_like(x, 1 - self.dropout))
-        return torch.sparse.mm(adj, x * mask) / (1 - self.dropout)
+        mask = torch.bernoulli(torch.ones(adj._values().size()) * (1 - self.dropout)).to(self.device)
+        values = adj._values() * mask
+        return torch.sparse_coo_tensor(adj._indices(), values, adj.size())
 
     def forward(self):
-        # Process modalities
+        # Process modalities 
+        img_feat = txt_feat = None
+        modal_feat = None
+        
         if self.v_feat is not None:
-            image_feat = self.image_trs(self.image_embedding.weight)
+            img_feat = self.image_encoder(self.image_embedding.weight)
             
         if self.t_feat is not None:
-            text_feat = self.text_trs(self.text_embedding.weight)
+            txt_feat = self.text_encoder(self.text_embedding.weight)
             
-        # Message passing on modality graph
-        h = self.item_embedding.weight
-        for _ in range(self.n_layers):
-            h = self.message_dropout(h, self.mm_adj)
-            h = F.normalize(h, p=2, dim=1)
+        # Multimodal fusion with attention
+        if img_feat is not None and txt_feat is not None:
+            # Cross-modal attention
+            modal_feat = self.modal_attn(
+                img_feat.unsqueeze(0),
+                torch.stack([img_feat, txt_feat], dim=1),
+                torch.stack([img_feat, txt_feat], dim=1)
+            ).squeeze(0)
+            modal_feat = F.normalize(modal_feat, p=2, dim=1)
+        else:
+            modal_feat = img_feat if img_feat is not None else txt_feat
             
-        # Graph convolution with residual connections
+        # Graph convolution with dropouts
         ego_embeddings = torch.cat([self.user_embedding.weight, self.item_embedding.weight], dim=0)
-        all_embeddings = [ego_embeddings]
+        all_embeddings = [F.normalize(ego_embeddings, p=2, dim=1)]
         
-        for _ in range(self.n_ui_layers):
-            ego_embeddings = self.message_dropout(ego_embeddings, self.norm_adj)
+        adj_dropout = self.message_dropout(self.adj_norm)
+        for _ in range(self.n_layers):
+            ego_embeddings = torch.sparse.mm(adj_dropout, ego_embeddings)
+            ego_embeddings = F.normalize(ego_embeddings, p=2, dim=1)
             all_embeddings.append(ego_embeddings)
             
         all_embeddings = torch.stack(all_embeddings, dim=1)
-        all_embeddings = all_embeddings.mean(dim=1)
+        all_embeddings = torch.mean(all_embeddings, dim=1)
         
+        # Split user-item embeddings
         user_embeddings, item_embeddings = torch.split(all_embeddings, [self.n_users, self.n_items])
-        item_embeddings = item_embeddings + h
         
-        return (
-            user_embeddings,
-            item_embeddings,
-            image_feat if self.v_feat is not None else None,
-            text_feat if self.t_feat is not None else None
-        )
+        # Enhance item embeddings with modal features
+        item_embeddings = item_embeddings + modal_feat
+        
+        return user_embeddings, item_embeddings, (img_feat, txt_feat)
 
     def calculate_loss(self, interaction):
         users = interaction[0]
         pos_items = interaction[1]
         neg_items = interaction[2]
         
-        user_emb, item_emb, img_emb, txt_emb = self.forward()
+        user_embeddings, item_embeddings, (img_feat, txt_feat) = self.forward()
         
-        # Graph-based recommendation loss
-        u_e = user_emb[users]
-        pos_e = item_emb[pos_items]
-        neg_e = item_emb[neg_items]
+        user_e = user_embeddings[users]
+        pos_e = item_embeddings[pos_items]
+        neg_e = item_embeddings[neg_items]
         
-        pos_scores = torch.sum(u_e * pos_e, dim=1)
-        neg_scores = torch.sum(u_e * neg_e, dim=1)
+        # Recommendation loss
+        pos_scores = torch.sum(user_e * pos_e, dim=1)
+        neg_scores = torch.sum(user_e * neg_e, dim=1)
         rec_loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
         
-        # Modal-aware recommendation loss
+        # Modal-specific loss
         modal_loss = 0.0
-        if img_emb is not None:
-            pos_img_scores = torch.sum(u_e * F.normalize(img_emb[pos_items], dim=1), dim=1)
-            neg_img_scores = torch.sum(u_e * F.normalize(img_emb[neg_items], dim=1), dim=1)
-            modal_loss += -torch.mean(F.logsigmoid(pos_img_scores - neg_img_scores))
-            
-        if txt_emb is not None:
-            pos_txt_scores = torch.sum(u_e * F.normalize(txt_emb[pos_items], dim=1), dim=1)
-            neg_txt_scores = torch.sum(u_e * F.normalize(txt_emb[neg_items], dim=1), dim=1)
-            modal_loss += -torch.mean(F.logsigmoid(pos_txt_scores - neg_txt_scores))
-            
+        if img_feat is not None and txt_feat is not None:
+            img_e = F.normalize(img_feat[pos_items], p=2, dim=1)
+            txt_e = F.normalize(txt_feat[pos_items], p=2, dim=1)
+            modal_loss = 1 - torch.mean(F.cosine_similarity(img_e, txt_e))
+        
         # L2 regularization
-        reg_loss = self.reg_weight * (
-            torch.norm(u_e, p=2) +
-            torch.norm(pos_e, p=2) +
-            torch.norm(neg_e, p=2)
+        l2_loss = self.reg_weight * (
+            torch.norm(user_e) + 
+            torch.norm(pos_e) + 
+            torch.norm(neg_e)
         )
         
-        # Cross-modal contrastive loss
-        if img_emb is not None and txt_emb is not None:
-            i_feat = F.normalize(img_emb[pos_items], dim=1)
-            t_feat = F.normalize(txt_emb[pos_items], dim=1)
-            contra_loss = -torch.mean(F.logsigmoid(torch.sum(i_feat * t_feat, dim=1)))
-            modal_loss += 0.1 * contra_loss
-        
-        return rec_loss + 0.2 * modal_loss + reg_loss
+        return rec_loss + 0.1 * modal_loss + l2_loss
 
     def full_sort_predict(self, interaction):
         user = interaction[0]
-        user_emb, item_emb, _, _ = self.forward()
-        scores = torch.matmul(user_emb[user], item_emb.transpose(0, 1))
+        user_embeddings, item_embeddings, _ = self.forward()
+        scores = torch.matmul(user_embeddings[user], item_embeddings.transpose(0, 1))
         return scores
