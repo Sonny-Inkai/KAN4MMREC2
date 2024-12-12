@@ -8,7 +8,7 @@ import numpy as np
 
 class MMGAT(GeneralRecommender):
     def __init__(self, config, dataset):
-        super(KANMMRec, self).__init__(config, dataset)
+        super(MMGAT, self).__init__(config, dataset)
         
         self.embedding_dim = config['embedding_size']
         self.feat_embed_dim = config['feat_embed_dim']
@@ -17,9 +17,6 @@ class MMGAT(GeneralRecommender):
         self.reg_weight = config['reg_weight']
         self.n_heads = 4
         self.temperature = 0.2
-        
-        self.n_users = dataset.user_num
-        self.n_items = dataset.item_num
         
         # Get interaction matrix
         self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
