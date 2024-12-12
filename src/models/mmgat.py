@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATConv, SAGEConv, TransformerConv
-from torch_sparse import SparseTensor
 from common.abstract_recommender import GeneralRecommender
 import math
 
