@@ -22,7 +22,7 @@ class MMGAT(GeneralRecommender):
         nn.init.xavier_uniform_(self.user_embedding.weight)
         nn.init.xavier_uniform_(self.item_embedding.weight)
         
-        # Initialize modality embeddings
+        # Initialize modality embeddings and projections
         if self.v_feat is not None:
             self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
             self.image_encoder = nn.Sequential(
@@ -42,17 +42,20 @@ class MMGAT(GeneralRecommender):
                 nn.Dropout(self.dropout),
                 nn.Linear(self.hidden_size, self.feat_embed_dim)
             )
-        
-        # Cross-modal attention
-        self.attention = nn.Sequential(
-            nn.Linear(self.feat_embed_dim * 2, self.feat_embed_dim),
-            nn.Tanh(),
-            nn.Linear(self.feat_embed_dim, 1),
-            nn.Softmax(dim=1)
-        )
-        
-        # Modal fusion layers
-        fusion_input_dim = self.feat_embed_dim * 2 if (self.v_feat is not None and self.t_feat is not None) else self.feat_embed_dim
+
+        # Modality fusion
+        if self.v_feat is not None and self.t_feat is not None:
+            self.modal_attention = nn.Sequential(
+                nn.Linear(self.feat_embed_dim * 2, 64),
+                nn.ReLU(),
+                nn.Linear(64, 2),
+                nn.Softmax(dim=1)
+            )
+            
+            fusion_input_dim = self.feat_embed_dim * 2
+        else:
+            fusion_input_dim = self.feat_embed_dim
+            
         self.fusion_layer = nn.Sequential(
             nn.Linear(fusion_input_dim, self.hidden_size),
             nn.LayerNorm(self.hidden_size),
@@ -61,30 +64,27 @@ class MMGAT(GeneralRecommender):
             nn.Linear(self.hidden_size, self.embedding_dim)
         )
         
-        # User preference modeling
-        self.user_pref = nn.Sequential(
+        # Item representation enhancement
+        self.item_enhance = nn.Sequential(
+            nn.Linear(self.embedding_dim * 2, self.hidden_size),
+            nn.LayerNorm(self.hidden_size),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.hidden_size, self.embedding_dim)
+        )
+        
+        # User preference projection
+        self.user_projection = nn.Sequential(
             nn.Linear(self.embedding_dim, self.hidden_size),
             nn.LayerNorm(self.hidden_size),
             nn.ReLU(),
             nn.Dropout(self.dropout),
             nn.Linear(self.hidden_size, self.embedding_dim)
         )
-        
-        # Final prediction layers
-        self.predictor = nn.Sequential(
-            nn.Linear(self.embedding_dim * 3, self.hidden_size),
-            nn.LayerNorm(self.hidden_size),
-            nn.ReLU(),
-            nn.Dropout(self.dropout),
-            nn.Linear(self.hidden_size, self.embedding_dim)
-        )
-        
+
         # Loss functions
-        self.bce_loss = nn.BCEWithLogitsLoss()
+        self.criterion = nn.BCEWithLogitsLoss()
         self.reg_loss = EmbLoss()
-        
-        # Initialize fusion weights
-        self.fusion_weights = nn.Parameter(torch.ones(2))
         
     def encode_modalities(self):
         image_feat = text_feat = None
@@ -98,42 +98,39 @@ class MMGAT(GeneralRecommender):
             text_feat = F.normalize(text_feat, p=2, dim=1)
             
         if image_feat is not None and text_feat is not None:
-            # Cross-modal attention
-            feat_concat = torch.cat([image_feat, text_feat], dim=-1)
-            attention_weights = self.attention(feat_concat)
-            weighted_feats = torch.cat([
-                image_feat.unsqueeze(1),
-                text_feat.unsqueeze(1)
-            ], dim=1)
-            fused_feats = (weighted_feats * attention_weights).sum(dim=1)
+            # Concatenate features for attention
+            concat_feat = torch.cat([image_feat, text_feat], dim=1)
+            attention_weights = self.modal_attention(concat_feat)
             
-            # Residual connection
-            fused_feats = fused_feats + image_feat + text_feat
+            # Apply attention weights
+            modal_features = torch.stack([image_feat, text_feat], dim=1)
+            attention_weights = attention_weights.unsqueeze(-1)
+            fused_features = (modal_features * attention_weights).sum(dim=1)
+            
+            # Concatenate original features with attention output
+            final_features = torch.cat([image_feat, text_feat], dim=1)
             
         elif image_feat is not None:
-            fused_feats = image_feat
+            final_features = image_feat
         else:
-            fused_feats = text_feat
+            final_features = text_feat
             
-        return self.fusion_layer(fused_feats)
+        return self.fusion_layer(final_features)
         
     def forward(self):
         # Get modal features
         item_modal_embeds = self.encode_modalities()
         
-        # Combine with ID embeddings
-        user_embeds = self.user_pref(self.user_embedding.weight)
+        # Process item embeddings
         item_id_embeds = self.item_embedding.weight
+        enhanced_item_embeds = self.item_enhance(
+            torch.cat([item_id_embeds, item_modal_embeds], dim=1)
+        )
         
-        # Final item representation with modal features
-        item_embeds = torch.cat([
-            item_id_embeds,
-            item_modal_embeds,
-            item_id_embeds * item_modal_embeds
-        ], dim=-1)
-        item_embeds = self.predictor(item_embeds)
+        # Process user embeddings
+        user_embeds = self.user_projection(self.user_embedding.weight)
         
-        return user_embeds, item_embeds
+        return user_embeds, enhanced_item_embeds
 
     def calculate_loss(self, interaction):
         users = interaction[0]
@@ -146,33 +143,32 @@ class MMGAT(GeneralRecommender):
         pos_e = item_embeds[pos_items]
         neg_e = item_embeds[neg_items]
         
-        # BPR loss with margin
-        pos_scores = (user_e * pos_e).sum(dim=-1)
-        neg_scores = (user_e * neg_e).sum(dim=-1)
-        margin = 1.0
-        basic_loss = torch.mean(F.softplus(-(pos_scores - neg_scores) + margin))
+        # BPR loss
+        pos_scores = (user_e * pos_e).sum(dim=1)
+        neg_scores = (user_e * neg_e).sum(dim=1)
         
-        # Contrastive loss for modalities
+        loss = -torch.mean(torch.log(torch.sigmoid(pos_scores - neg_scores) + 1e-8))
+        
+        # Modal consistency loss
+        modal_loss = 0
         if self.v_feat is not None and self.t_feat is not None:
             image_feat = self.image_encoder(self.image_embedding.weight)
             text_feat = self.text_encoder(self.text_embedding.weight)
             
-            pos_sim = F.cosine_similarity(image_feat[pos_items], text_feat[pos_items])
-            neg_sim = F.cosine_similarity(image_feat[neg_items], text_feat[neg_items])
-            modal_loss = torch.mean(F.softplus(neg_sim - pos_sim + margin))
-            
-            # L2 regularization
-            l2_loss = self.reg_weight * (
-                user_e.norm(2).pow(2) +
-                pos_e.norm(2).pow(2) +
-                neg_e.norm(2).pow(2) +
-                image_feat[pos_items].norm(2).pow(2) +
-                text_feat[pos_items].norm(2).pow(2)
-            ) / float(len(users))
-            
-            return basic_loss + 0.1 * modal_loss + l2_loss
-            
-        return basic_loss + self.reg_weight * self.reg_loss(user_e, pos_e, neg_e)
+            pos_modal_sim = F.cosine_similarity(
+                image_feat[pos_items],
+                text_feat[pos_items]
+            )
+            modal_loss = 1 - pos_modal_sim.mean()
+        
+        # L2 regularization
+        reg_loss = self.reg_weight * (
+            user_e.norm(2).pow(2) +
+            pos_e.norm(2).pow(2) +
+            neg_e.norm(2).pow(2)
+        ) / float(len(users))
+        
+        return loss + 0.1 * modal_loss + reg_loss
 
     def predict(self, interaction):
         user = interaction[0]
