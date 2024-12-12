@@ -27,7 +27,8 @@ class MMGAT(GeneralRecommender):
         self.mm_adj = None
         self.edge_index = None
         self.edge_values = None
-        
+        self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
+
         self._init_graph()
         self._init_modules()
         
@@ -65,7 +66,6 @@ class MMGAT(GeneralRecommender):
             
     def _init_graph(self):
         # Build interaction graph
-        self.interaction_matrix = self.dataset.inter_matrix(form='coo').astype(np.float32)
         indices = self._build_edges()
         self.edge_index = torch.LongTensor(indices).to(self.device)
         self.edge_values = self._compute_edge_values(indices)
