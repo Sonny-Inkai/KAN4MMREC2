@@ -8,7 +8,7 @@ from common.abstract_recommender import GeneralRecommender
 
 class MMGAT(GeneralRecommender):
     def __init__(self, config, dataset):
-        super(MMGAT, self).__init__()
+        super(MMGAT, self).__init__(config, dataset)
         self.device = config['device']
         
         # Core parameters
