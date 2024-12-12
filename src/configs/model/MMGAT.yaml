@@ -31,3 +31,4 @@ n_mm_layers: 1
 cl_weight: 2.0
 mm_image_weight: 0.5
 temperature: 0.7
+ssl_weight: 0.1

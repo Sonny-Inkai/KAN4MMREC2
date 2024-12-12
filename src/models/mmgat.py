@@ -119,7 +119,7 @@ class MMGAT(GeneralRecommender):
         self.softmax = nn.Softmax(dim=0)
         
         # Loss weights
-        self.ssl_weight = config.get('ssl_weight', 0.1)
+        self.ssl_weight = config['ssl_weight']
         self.build_item_graph = True
         
     def get_norm_adj_mat(self):
