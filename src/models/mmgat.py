@@ -10,7 +10,7 @@ from common.abstract_recommender import GeneralRecommender
 class ModalTower(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
         super().__init__()
-        self.transform = nn.Sequential(
+        self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
@@ -19,7 +19,7 @@ class ModalTower(nn.Module):
         )
         
     def forward(self, x):
-        return self.transform(x)
+        return self.net(x)
 
 class MMGAT(GeneralRecommender):
     def __init__(self, config, dataset):
@@ -29,15 +29,14 @@ class MMGAT(GeneralRecommender):
         self.feat_embed_dim = config["feat_embed_dim"]
         self.n_layers = config["n_mm_layers"]
         self.reg_weight = config["reg_weight"]
+        self.knn_k = config["knn_k"]
         self.n_nodes = self.n_users + self.n_items
         
-        # Embeddings
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
         self.item_embedding = nn.Embedding(self.n_items, self.embedding_dim)
         nn.init.xavier_normal_(self.user_embedding.weight)
         nn.init.xavier_normal_(self.item_embedding.weight)
         
-        # Modal towers
         if self.v_feat is not None:
             self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
             self.image_tower = ModalTower(self.v_feat.shape[1], self.feat_embed_dim * 2, self.feat_embed_dim)
@@ -46,18 +45,16 @@ class MMGAT(GeneralRecommender):
             self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
             self.text_tower = ModalTower(self.t_feat.shape[1], self.feat_embed_dim * 2, self.feat_embed_dim)
         
-        # Load dataset info
         self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
-        self.norm_adj = self.get_norm_adj_mat().to(self.device)
-        
-        # Initialize Graph Structure
-        self.build_graph_structure()
+        self.norm_adj = None
         self.to(self.device)
+        self.build_graph_structure()
 
-    def get_norm_adj_mat(self):
+    def build_graph_structure(self):
         A = sp.dok_matrix((self.n_nodes, self.n_nodes), dtype=np.float32)
         inter_M = self.interaction_matrix
         inter_M_t = self.interaction_matrix.transpose()
+        
         data_dict = dict(zip(zip(inter_M.row, inter_M.col + self.n_users), [1] * inter_M.nnz))
         data_dict.update(dict(zip(zip(inter_M_t.row + self.n_users, inter_M_t.col), [1] * inter_M_t.nnz)))
         for key, value in data_dict.items():
@@ -68,28 +65,31 @@ class MMGAT(GeneralRecommender):
         D = sp.diags(d_inv)
         L = D * A * D
         L = sp.coo_matrix(L)
-        indices = torch.LongTensor([L.row, L.col])
-        values = torch.FloatTensor(L.data)
-        return torch.sparse_coo_tensor(indices, values, torch.Size(L.shape))
-
-    def build_graph_structure(self):
+        
+        indices = np.vstack([L.row, L.col])
+        i = torch.LongTensor(indices).to(self.device)
+        v = torch.FloatTensor(L.data).to(self.device)
+        self.norm_adj = torch.sparse_coo_tensor(i, v, torch.Size(L.shape))
+        
         if self.v_feat is not None:
-            self.image_adj = self.build_knn_neighborhood(self.v_feat)
+            self.image_adj = self.build_knn_graph(self.v_feat)
         if self.t_feat is not None:
-            self.text_adj = self.build_knn_neighborhood(self.t_feat)
+            self.text_adj = self.build_knn_graph(self.t_feat)
 
-    def build_knn_neighborhood(self, features):
-        sim = torch.mm(F.normalize(features, dim=1), F.normalize(features, dim=1).t())
-        values, indices = torch.topk(sim, k=64, dim=1)
-        rows = torch.arange(features.size(0)).repeat_interleave(64)
-        cols = indices.reshape(-1)
-        v = values.reshape(-1)
+    def build_knn_graph(self, features):
+        features = features.to(self.device)
+        sim = torch.matmul(F.normalize(features, dim=1), F.normalize(features, dim=1).t())
+        values, indices = torch.topk(sim, k=self.knn_k, dim=1)
+        rows = torch.arange(features.size(0), device=self.device).view(-1, 1).expand_as(indices).flatten()
+        cols = indices.flatten()
+        edge_index = torch.stack([rows, cols], dim=0)
+        edge_weight = values.flatten()
+        
         adj = torch.sparse_coo_tensor(
-            torch.stack([rows, cols]), 
-            v,
+            edge_index, edge_weight, 
             (features.size(0), features.size(0))
-        ).to(self.device)
-        return adj
+        )
+        return adj.coalesce()
 
     def bpr_loss(self, users, pos_items, neg_items):
         pos_scores = torch.sum(users * pos_items, dim=1)
@@ -97,40 +97,38 @@ class MMGAT(GeneralRecommender):
         return -torch.mean(F.logsigmoid(pos_scores - neg_scores))
 
     def forward(self, adj):
-        # Process modalities
         v_feat, t_feat = None, None
         
         if self.v_feat is not None:
             v_feat = self.image_tower(self.image_embedding.weight)
             v_feat = torch.sparse.mm(self.image_adj, v_feat)
-            
+        
         if self.t_feat is not None:
             t_feat = self.text_tower(self.text_embedding.weight)
             t_feat = torch.sparse.mm(self.text_adj, t_feat)
         
-        # Fusion
-        i_feat = torch.zeros_like(self.item_embedding.weight)
+        item_feat = torch.zeros_like(self.item_embedding.weight)
         if v_feat is not None:
-            i_feat += v_feat
+            item_feat += v_feat
         if t_feat is not None:
-            i_feat += t_feat
+            item_feat += t_feat
         if v_feat is not None and t_feat is not None:
-            i_feat = i_feat / 2
-
-        # Graph convolution
+            item_feat = item_feat / 2
+            
         ego_embeddings = torch.cat([self.user_embedding.weight, self.item_embedding.weight], dim=0)
-        embeddings_list = [ego_embeddings]
+        all_embeddings = [ego_embeddings]
         
         for _ in range(self.n_layers):
             ego_embeddings = torch.sparse.mm(adj, ego_embeddings)
-            embeddings_list.append(ego_embeddings)
+            all_embeddings.append(ego_embeddings)
             
-        all_embeddings = torch.stack(embeddings_list, dim=1)
+        all_embeddings = torch.stack(all_embeddings, dim=1)
         all_embeddings = all_embeddings.mean(dim=1)
-        u_g_embeddings, i_g_embeddings = torch.split(all_embeddings, [self.n_users, self.n_items])
         
-        i_g_embeddings = i_g_embeddings + i_feat
-        return u_g_embeddings, i_g_embeddings
+        user_all, item_all = torch.split(all_embeddings, [self.n_users, self.n_items])
+        item_all = item_all + item_feat
+        
+        return user_all, item_all
 
     def calculate_loss(self, interaction):
         users = interaction[0]
@@ -145,22 +143,19 @@ class MMGAT(GeneralRecommender):
         
         batch_mf_loss = self.bpr_loss(u_g_embeddings, pos_i_g_embeddings, neg_i_g_embeddings)
         
-        mf_v_loss = 0.0
-        mf_t_loss = 0.0
-        
-        if self.t_feat is not None:
-            t_feat = self.text_tower(self.text_embedding.weight)
-            mf_t_loss = self.bpr_loss(ua_embeddings[users], t_feat[pos_items], t_feat[neg_items])
-            
+        mf_v_loss, mf_t_loss = 0.0, 0.0
         if self.v_feat is not None:
             v_feat = self.image_tower(self.image_embedding.weight)
             mf_v_loss = self.bpr_loss(ua_embeddings[users], v_feat[pos_items], v_feat[neg_items])
+            
+        if self.t_feat is not None:
+            t_feat = self.text_tower(self.text_embedding.weight)
+            mf_t_loss = self.bpr_loss(ua_embeddings[users], t_feat[pos_items], t_feat[neg_items])
         
-        return batch_mf_loss + self.reg_weight * (mf_t_loss + mf_v_loss)
+        return batch_mf_loss + self.reg_weight * (mf_v_loss + mf_t_loss)
 
     def full_sort_predict(self, interaction):
         user = interaction[0]
         restore_user_e, restore_item_e = self.forward(self.norm_adj)
-        u_embeddings = restore_user_e[user]
-        scores = torch.matmul(u_embeddings, restore_item_e.transpose(0, 1))
+        scores = torch.matmul(restore_user_e[user], restore_item_e.transpose(0, 1))
         return scores
