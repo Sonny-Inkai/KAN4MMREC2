@@ -1,13 +1,13 @@
 # Hyperparameter configuration for MMRecModel
 
-embedding_size: 32
-feat_embed_dim: 32
+embedding_size: 64
+feat_embed_dim: 64
 
 # Number of layers for multimodal and user-item interactions
 n_layers: 2
 
 # Dropout rates to prevent overfitting
-dropout: 0.8
+dropout: 0.2
 
 # Regularization weights for different components
 reg_weight: 0.01
