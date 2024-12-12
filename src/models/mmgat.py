@@ -89,14 +89,13 @@ class MMGAT(GeneralRecommender):
         
         # Graph Layers
         self.user_graph = LightGraphConv(self.dropout)
-        
+        self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
         # Initialize Graph Structure
         self.build_graph_structure()
         self.to(self.device)
         
     def build_graph_structure(self):
         # Build user-item interaction graph
-        self.interaction_matrix = self.dataset.inter_matrix(form='coo').astype(np.float32)
         ui_adj = sp.dok_matrix((self.n_users + self.n_items, self.n_users + self.n_items), dtype=np.float32)
         ui_adj = ui_adj.tolil()
         R = self.interaction_matrix.tolil()
