@@ -33,3 +33,4 @@ mm_image_weight: 0.5
 temperature: 0.7
 ssl_weight: 0.1
 n_heads: 2
+num_clusters: 10
