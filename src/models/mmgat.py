@@ -135,22 +135,22 @@ class MMGAT(GeneralRecommender):
         # BPR loss
         pos_scores = torch.sum(u_e * pos_e, dim=1)
         neg_scores = torch.sum(u_e * neg_e, dim=1)
-        mf_loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
+        bpr_loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
         
-        # Modal recommendation loss
-        modal_loss = 0.0
+        # Contrastive loss for modality alignment
+        contrastive_loss = 0.0
         if img_feat is not None:
-            modal_loss += -torch.mean(F.logsigmoid(
-                torch.sum(u_e * F.normalize(img_feat[pos_items], dim=1), dim=1) -
-                torch.sum(u_e * F.normalize(img_feat[neg_items], dim=1), dim=1)
-            ))
+            contrastive_loss += torch.mean(
+                1 - F.cosine_similarity(u_e, img_feat[pos_items]) +
+                F.cosine_similarity(u_e, img_feat[neg_items])
+            )
             
         if txt_feat is not None:
-            modal_loss += -torch.mean(F.logsigmoid(
-                torch.sum(u_e * F.normalize(txt_feat[pos_items], dim=1), dim=1) -
-                torch.sum(u_e * F.normalize(txt_feat[neg_items], dim=1), dim=1)
-            ))
-            
+            contrastive_loss += torch.mean(
+                1 - F.cosine_similarity(u_e, txt_feat[pos_items]) +
+                F.cosine_similarity(u_e, txt_feat[neg_items])
+            )
+        
         # Regularization
         reg_loss = self.reg_weight * (
             torch.norm(u_e) + 
@@ -158,7 +158,11 @@ class MMGAT(GeneralRecommender):
             torch.norm(neg_e)
         )
         
-        return mf_loss + 0.2 * modal_loss + reg_loss
+        # Total loss with adaptive weighting
+        total_loss = bpr_loss + 0.5 * contrastive_loss + reg_loss
+        return total_loss
+
+
 
     def full_sort_predict(self, interaction):
         user = interaction[0]
