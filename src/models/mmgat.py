@@ -28,7 +28,7 @@ class ModalEncoder(nn.Module):
         return feat, pred
 
 class GraphAttention(nn.Module):
-    def __init__(self, dim, heads=4, dropout=0.1):
+    def __init__(self, dim, heads=2, dropout=0.1):
         super().__init__()
         self.dim = dim
         self.heads = heads
