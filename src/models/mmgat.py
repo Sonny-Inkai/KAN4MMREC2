@@ -142,35 +142,41 @@ class MMGAT(GeneralRecommender):
         data = torch.FloatTensor(L.data)
         return torch.sparse.FloatTensor(i, data, torch.Size((self.n_nodes, self.n_nodes)))
 
+    def get_mm_graph(self, features):
+        sim = torch.mm(F.normalize(features, dim=1), F.normalize(features, dim=1).t())
+        topk_sim, topk_idx = torch.topk(sim, k=self.knn_k, dim=1)
+        
+        row_idx = torch.arange(features.size(0), device=self.device).view(-1, 1).repeat(1, self.knn_k)
+        adj = torch.zeros_like(sim, device=self.device)
+        adj[row_idx.view(-1), topk_idx.view(-1)] = 1.0
+        
+        # Symmetrize adjacency matrix
+        adj = adj + adj.t()
+        adj[adj > 0] = 1.0
+        
+        # Normalize adjacency matrix
+        deg = adj.sum(1)
+        deg_inv_sqrt = torch.pow(deg + 1e-7, -0.5)
+        norm_adj = deg_inv_sqrt.view(-1, 1) * adj * deg_inv_sqrt.view(1, -1)
+        
+        return norm_adj
+
     def build_mm_graph(self):
         weight = self.softmax(self.modal_weight)
         
         if self.v_feat is not None:
             image_feats = self.image_trs(self.image_embedding.weight)
-            image_sim = torch.mm(F.normalize(image_feats), F.normalize(image_feats).t())
-            image_adj = torch.zeros_like(image_sim).to(self.device)
-            image_adj[torch.arange(len(image_sim)), torch.topk(image_sim, self.knn_k, dim=1)[1]] = 1
-            image_adj = self.compute_normalized_laplacian_dense(image_adj)
+            image_adj = self.get_mm_graph(image_feats)
             self.mm_adj = image_adj
             
         if self.t_feat is not None:
             text_feats = self.text_trs(self.text_embedding.weight)
-            text_sim = torch.mm(F.normalize(text_feats), F.normalize(text_feats).t())
-            text_adj = torch.zeros_like(text_sim).to(self.device)
-            text_adj[torch.arange(len(text_sim)), torch.topk(text_sim, self.knn_k, dim=1)[1]] = 1
-            text_adj = self.compute_normalized_laplacian_dense(text_adj)
+            text_adj = self.get_mm_graph(text_feats)
             
             if self.v_feat is not None:
                 self.mm_adj = weight[0] * image_adj + weight[1] * text_adj
             else:
                 self.mm_adj = text_adj
-
-    def compute_normalized_laplacian_dense(self, adj):
-        row_sum = adj.sum(1)
-        d_inv_sqrt = torch.pow(row_sum, -0.5)
-        d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.0
-        d_mat_inv_sqrt = torch.diag(d_inv_sqrt)
-        return torch.mm(torch.mm(d_mat_inv_sqrt, adj), d_mat_inv_sqrt)
 
     def forward(self, build_item_graph=False):
         if build_item_graph:
@@ -180,7 +186,7 @@ class MMGAT(GeneralRecommender):
         
         # Apply MM graph convolution
         for i in range(self.n_layers):
-            h = torch.mm(self.mm_adj.detach(), h)
+            h = torch.mm(self.mm_adj, h)
         
         # Process UI graph
         ego_embeddings = torch.cat((self.user_embedding.weight, self.item_id_embedding.weight), dim=0)
@@ -227,7 +233,7 @@ class MMGAT(GeneralRecommender):
                 torch.sum(pos_image_embeddings * pos_text_embeddings, dim=1) / self.temperature
             ))
 
-        # Regularization 
+        # Regularization
         reg_loss = self.reg_weight * (
             torch.norm(u_g_embeddings) +
             torch.norm(pos_i_g_embeddings) +
