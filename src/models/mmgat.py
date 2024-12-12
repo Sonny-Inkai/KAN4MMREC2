@@ -7,9 +7,9 @@ import numpy as np
 from common.abstract_recommender import GeneralRecommender
 from common.loss import BPRLoss, EmbLoss
 
-class AdvancedMultiModalRec(GeneralRecommender):
+class MMGAT(GeneralRecommender):
     def __init__(self, config, dataset):
-        super(AdvancedMultiModalRec, self).__init__(config, dataset)
+        super(MMGAT, self).__init__(config, dataset)
         
         # Basic configuration
         self.embedding_dim = config['embedding_size']
