@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATConv, SAGEConv
 from common.abstract_recommender import GeneralRecommender
+import scipy.sparse as sp
+import numpy as np
 
 class MMGAT(GeneralRecommender):
     def __init__(self, config, dataset):
@@ -14,6 +16,13 @@ class MMGAT(GeneralRecommender):
         self.dropout = config['dropout']
         self.reg_weight = config['reg_weight']
         self.n_layers = 2
+
+        self.n_nodes = self.n_users + self.n_items
+        
+        # Get interaction matrix and create normalized adjacency matrix
+        self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
+        self.adj_matrix = self.get_adj_mat()
+        self.edge_index = self.get_edge_index().to(self.device)
         
         # Base embeddings
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
@@ -47,12 +56,38 @@ class MMGAT(GeneralRecommender):
         self.gnn_layers = nn.ModuleList([
             GraphLayer(
                 self.embedding_dim,
-                self.num_heads
+                self.num_heads,
+                self.dropout
             ) for _ in range(self.n_layers)
         ])
         
         self.apply(self._init_weights)
         
+    def get_adj_mat(self):
+        adj_mat = sp.dok_matrix((self.n_nodes, self.n_nodes), dtype=np.float32)
+        adj_mat = adj_mat.tolil()
+        R = self.interaction_matrix.tolil()
+        
+        adj_mat[:self.n_users, self.n_users:] = R
+        adj_mat[self.n_users:, :self.n_users] = R.T
+        adj_mat = adj_mat.todok()
+        
+        def normalized_adj_single(adj):
+            rowsum = np.array(adj.sum(1))
+            d_inv = np.power(rowsum, -1).flatten()
+            d_inv[np.isinf(d_inv)] = 0.
+            d_mat_inv = sp.diags(d_inv)
+            norm_adj = d_mat_inv.dot(adj)
+            return norm_adj.tocoo()
+        
+        norm_adj_mat = normalized_adj_single(adj_mat + sp.eye(adj_mat.shape[0]))
+        return norm_adj_mat.tocsr()
+    
+    def get_edge_index(self):
+        adj_mat = self.adj_matrix.tocoo()
+        edge_index = torch.tensor([adj_mat.row, adj_mat.col], dtype=torch.long)
+        return edge_index
+            
     def _init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
             module.weight.data.normal_(mean=0.0, std=0.02)
@@ -86,7 +121,7 @@ class MMGAT(GeneralRecommender):
         emb_list = [all_emb]
         
         for layer in self.gnn_layers:
-            all_emb = layer(all_emb)
+            all_emb = layer(all_emb, self.edge_index)
             emb_list.append(all_emb)
             
         all_emb = torch.stack(emb_list, dim=1)
@@ -160,37 +195,31 @@ class ModalFusion(nn.Module):
         )
         
     def forward(self, features):
-        # Stack features: [num_modalities, num_items, dim]
         x = torch.stack(features, dim=0)
-        batch_size = x.size(1)
-        
-        # Reshape: [num_items, num_modalities, dim]
         x = x.transpose(0, 1)
         
-        # Self-attention
         attn_out, _ = self.self_attn(x, x, x)
         x = self.norm1(x + attn_out)
-        
-        # FFN
         x = self.norm2(x + self.ffn(x))
         
-        # Mean pooling across modalities
         return x.mean(dim=1)
 
 class GraphLayer(nn.Module):
-    def __init__(self, dim, num_heads):
+    def __init__(self, dim, num_heads, dropout):
         super().__init__()
         
-        self.gat = GATConv(dim, dim // num_heads, heads=num_heads)
+        self.gat = GATConv(dim, dim // num_heads, heads=num_heads, dropout=dropout)
         self.sage = SAGEConv(dim, dim)
         self.proj = nn.Linear(dim * 2, dim)
         self.norm = nn.LayerNorm(dim)
+        self.dropout = nn.Dropout(dropout)
         
-    def forward(self, x):
+    def forward(self, x, edge_index):
         gat_out = self.gat(x, edge_index)
         sage_out = self.sage(x, edge_index)
         
         concat = torch.cat([gat_out, sage_out], dim=-1)
         out = self.proj(concat)
+        out = self.dropout(out)
         
         return self.norm(out + x)
