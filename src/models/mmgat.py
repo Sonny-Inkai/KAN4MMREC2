@@ -10,7 +10,7 @@ from common.abstract_recommender import GeneralRecommender
 class MultimodalAttention(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        self.temperature = nn.Parameter(torch.ones([]) * 0.07)
+        self.temperature = 0.07
         self.cross_attention = nn.MultiheadAttention(dim, 4, dropout=0.1, batch_first=True)
         self.norm = nn.LayerNorm(dim)
         self.fuse = nn.Sequential(
@@ -44,9 +44,9 @@ class MMGAT(GeneralRecommender):
         self.embedding_dim = config["embedding_size"]
         self.feat_embed_dim = config["feat_embed_dim"]
         self.n_layers = config["n_mm_layers"]
-        self.temperature = config["temperature"]
         self.reg_weight = config["reg_weight"]
         self.n_nodes = self.n_users + self.n_items
+        self.temperature = 0.07
         
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
         self.item_embedding = nn.Embedding(self.n_items, self.embedding_dim)
@@ -96,12 +96,10 @@ class MMGAT(GeneralRecommender):
         return torch.sparse_coo_tensor(indices, values, L.shape).to(self.device)
 
     def forward(self):
-        # Process modalities
         if self.v_feat is not None and self.t_feat is not None:
             image_feat = self.image_proj(self.image_embedding.weight)
             text_feat = self.text_proj(self.text_embedding.weight)
             
-            # Cross-modal attention
             img_enhanced = self.modal_attention(image_feat, text_feat)
             txt_enhanced = self.modal_attention(text_feat, image_feat)
             modal_feat = (img_enhanced + txt_enhanced) / 2
@@ -110,7 +108,6 @@ class MMGAT(GeneralRecommender):
             txt_enhanced = self.text_proj(self.text_embedding.weight) if self.t_feat is not None else None
             modal_feat = img_enhanced if img_enhanced is not None else txt_enhanced
 
-        # Graph convolution
         ego_embeddings = torch.cat([self.user_embedding.weight, self.item_embedding.weight], dim=0)
         all_embeddings = [ego_embeddings]
         
@@ -124,7 +121,6 @@ class MMGAT(GeneralRecommender):
         
         user_embeddings, item_embeddings = torch.split(all_embeddings, [self.n_users, self.n_items])
         
-        # Combine with modal features
         if modal_feat is not None:
             item_embeddings = item_embeddings + self.predictor(modal_feat)
         
@@ -141,18 +137,17 @@ class MMGAT(GeneralRecommender):
         pos_embeddings = item_embeddings[pos_items]
         neg_embeddings = item_embeddings[neg_items]
         
-        # BPR loss
         pos_scores = torch.sum(u_embeddings * pos_embeddings, dim=1)
         neg_scores = torch.sum(u_embeddings * neg_embeddings, dim=1)
         bpr_loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
         
-        # Contrastive loss for modalities
         contrastive_loss = 0.0
         if img_emb is not None and txt_emb is not None:
-            pos_sim = F.cosine_similarity(img_emb[pos_items], txt_emb[pos_items])
-            contrastive_loss = -torch.mean(F.logsigmoid(pos_sim / torch.Tensor(self.temperature)))
+            img_feat = F.normalize(img_emb[pos_items], dim=1)
+            txt_feat = F.normalize(txt_emb[pos_items], dim=1)
+            pos_sim = F.cosine_similarity(img_feat, txt_feat)
+            contrastive_loss = -torch.mean(F.logsigmoid(pos_sim / self.temperature))
         
-        # L2 regularization
         reg_loss = self.reg_weight * (
             torch.norm(u_embeddings) +
             torch.norm(pos_embeddings) +
