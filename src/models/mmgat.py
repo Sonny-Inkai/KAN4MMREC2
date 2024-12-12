@@ -8,9 +8,9 @@ import scipy.sparse as sp
 from common.abstract_recommender import GeneralRecommender
 from common.loss import BPRLoss, EmbLoss
 
-class MMGAT(GeneralRecommender):
+class DualChannelRec(GeneralRecommender):
     def __init__(self, config, dataset):
-        super(MMGAT, self).__init__(config, dataset)
+        super(DualChannelRec, self).__init__(config, dataset)
         
         self.embedding_dim = config['embedding_size']
         self.feat_embed_dim = config['feat_embed_dim']
@@ -24,13 +24,17 @@ class MMGAT(GeneralRecommender):
         
         # Load interaction matrix
         self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
-        self.norm_adj = self.get_norm_adj_mat().to(self.device)
+        self.norm_adj = self.get_norm_adj_mat()
         
         # Initialize embeddings
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
         self.item_id_embedding = nn.Embedding(self.n_items, self.embedding_dim)
         nn.init.xavier_uniform_(self.user_embedding.weight)
         nn.init.xavier_uniform_(self.item_id_embedding.weight)
+        
+        # Move embeddings to device
+        self.user_embedding = self.user_embedding.to(self.device)
+        self.item_id_embedding = self.item_id_embedding.to(self.device)
         
         # Multimodal components
         if self.v_feat is not None:
@@ -45,6 +49,10 @@ class MMGAT(GeneralRecommender):
                 nn.ReLU(),
                 nn.Linear(self.feat_embed_dim // 2, 1)
             )
+            # Move to device
+            self.image_embedding = self.image_embedding.to(self.device)
+            self.image_projector = self.image_projector.to(self.device)
+            self.image_attention = self.image_attention.to(self.device)
             
         if self.t_feat is not None:
             self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
@@ -58,6 +66,10 @@ class MMGAT(GeneralRecommender):
                 nn.ReLU(),
                 nn.Linear(self.feat_embed_dim // 2, 1)
             )
+            # Move to device
+            self.text_embedding = self.text_embedding.to(self.device)
+            self.text_projector = self.text_projector.to(self.device)
+            self.text_attention = self.text_attention.to(self.device)
 
         # Cross-modal fusion
         self.modal_fusion = nn.Sequential(
@@ -65,14 +77,17 @@ class MMGAT(GeneralRecommender):
             nn.LayerNorm(self.feat_embed_dim),
             nn.ReLU(),
             nn.Dropout(self.dropout)
-        )
+        ).to(self.device)
         
         # Dual channel aggregation
-        self.channel_weight = nn.Parameter(torch.FloatTensor([0.5, 0.5]))
+        self.channel_weight = nn.Parameter(torch.FloatTensor([0.5, 0.5])).to(self.device)
         self.softmax = nn.Softmax(dim=0)
         
         # Initialize multimodal graphs
-        self.mm_adj = self._init_mm_graph()
+        self.mm_adj = None
+        self.norm_adj = self.norm_adj.to(self.device)
+        with torch.no_grad():
+            self.mm_adj = self._init_mm_graph().to(self.device)
         
     def get_norm_adj_mat(self):
         adj_mat = sp.dok_matrix((self.n_nodes, self.n_nodes), dtype=np.float32)
@@ -84,8 +99,7 @@ class MMGAT(GeneralRecommender):
         adj_mat = adj_mat.todok()
         
         row_sum = np.array(adj_mat.sum(axis=1))
-        d_inv = np.power(row_sum, -0.5).flatten()
-        d_inv[np.isinf(d_inv)] = 0.
+        d_inv = np.power(row_sum + 1e-10, -0.5).flatten()  # Add epsilon to avoid division by zero
         d_mat_inv = sp.diags(d_inv)
         
         norm_adj = d_mat_inv.dot(adj_mat).dot(d_mat_inv)
@@ -96,7 +110,7 @@ class MMGAT(GeneralRecommender):
         indices = torch.from_numpy(np.vstack((sparse_mx.row, sparse_mx.col))).long()
         values = torch.from_numpy(sparse_mx.data)
         shape = torch.Size(sparse_mx.shape)
-        return torch.sparse.FloatTensor(indices, values, shape)
+        return torch.sparse_coo_tensor(indices, values, shape)
         
     def _init_mm_graph(self):
         v_adj, t_adj = None, None
@@ -118,13 +132,14 @@ class MMGAT(GeneralRecommender):
         sim_matrix = F.normalize(embeddings, p=2, dim=1) @ F.normalize(embeddings, p=2, dim=1).t()
         topk_values, topk_indices = torch.topk(sim_matrix, k=self.knn_k, dim=1)
         
-        row_indices = torch.arange(embeddings.size(0)).view(-1, 1).expand(-1, self.knn_k)
+        row_indices = torch.arange(embeddings.size(0), device=self.device).view(-1, 1).expand(-1, self.knn_k)
         adj_indices = torch.stack([row_indices.flatten(), topk_indices.flatten()], dim=0)
         adj_values = topk_values.flatten()
         
-        adj_tensor = torch.sparse.FloatTensor(
+        adj_tensor = torch.sparse_coo_tensor(
             adj_indices, adj_values, 
-            torch.Size([embeddings.size(0), embeddings.size(0)])
+            torch.Size([embeddings.size(0), embeddings.size(0)]),
+            device=self.device
         )
         return self._normalize_adj(adj_tensor)
         
