@@ -62,9 +62,6 @@ class MMGAT(GeneralRecommender):
     def __init__(self, config, dataset):
         super(MMGAT, self).__init__(config, dataset)
         
-        # Basic settings
-        self.n_users = dataset.user_num
-        self.n_items = dataset.item_num
         self.n_nodes = self.n_users + self.n_items
         
         self.embedding_dim = config["embedding_size"]
