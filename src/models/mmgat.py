@@ -18,7 +18,7 @@ class MMGAT(GeneralRecommender):
         self.reg_weight = config['reg_weight']
         self.dropout = config['dropout']
         self.temperature = config['temperature']
-        self.n_heads = config['n_heads']
+        self.n_heads = 4
         self.ssl_weight = config['ssl_weight']
         self.modal_fusion = config['modal_fusion']
         
