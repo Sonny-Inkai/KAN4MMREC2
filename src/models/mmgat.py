@@ -7,94 +7,104 @@ import torch.nn as nn
 import torch.nn.functional as F
 from common.abstract_recommender import GeneralRecommender
 
-class AttentionLayer(nn.Module):
-    def __init__(self, in_dim, dropout=0.2):
+class ModalEncoder(nn.Module):
+    def __init__(self, input_dim, embed_dim, dropout=0.1):
         super().__init__()
-        self.att_w = nn.Parameter(torch.zeros(size=(1, in_dim)))
-        nn.init.xavier_uniform_(self.att_w.data)
-        self.leaky_relu = nn.LeakyReLU(0.2)
-        self.dropout = nn.Dropout(dropout)
-        self.softmax = nn.Softmax(dim=-1)
-        
-    def forward(self, query, key, value, mask=None):
-        energy = self.leaky_relu(torch.matmul(query, key.transpose(-2, -1)))
-        if mask is not None:
-            energy = energy.masked_fill(mask == 0, -1e9)
-        attention = self.dropout(self.softmax(energy))
-        return torch.matmul(attention, value)
-
-class ModalFusion(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.attention = AttentionLayer(dim)
-        self.gate = nn.Sequential(
-            nn.Linear(dim * 2, 2),
-            nn.Softmax(dim=-1)
+        self.projector = nn.Sequential(
+            nn.Linear(input_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU(),
+            nn.Dropout(dropout)
         )
+        self.predictor = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim)
+        )
+        
+    def forward(self, x):
+        feat = self.projector(x)
+        pred = self.predictor(feat.detach())
+        return feat, pred
+
+class GraphAttention(nn.Module):
+    def __init__(self, dim, heads=4, dropout=0.1):
+        super().__init__()
+        self.dim = dim
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.scale = self.head_dim ** -0.5
+        
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.o_proj = nn.Linear(dim, dim)
+        
+        self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(dim)
         
-    def forward(self, x1, x2):
-        cross_x1 = self.attention(x1, x2, x2)
-        cross_x2 = self.attention(x2, x1, x1)
-        weights = self.gate(torch.cat([cross_x1, cross_x2], dim=-1))
-        fused = weights[:, 0:1] * cross_x1 + weights[:, 1:2] * cross_x2
-        return self.norm(fused)
+    def forward(self, x, adj):
+        B, N, C = x.shape
+        q = self.q_proj(x).reshape(B, N, self.heads, self.head_dim).permute(0, 2, 1, 3)
+        k = self.k_proj(x).reshape(B, N, self.heads, self.head_dim).permute(0, 2, 1, 3)
+        v = self.v_proj(x).reshape(B, N, self.heads, self.head_dim).permute(0, 2, 1, 3)
+        
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.masked_fill(adj.unsqueeze(1) == 0, -1e9)
+        attn = F.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
+        
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.o_proj(x)
+        return self.norm(x)
 
 class MMGAT(GeneralRecommender):
     def __init__(self, config, dataset):
         super(MMGAT, self).__init__(config, dataset)
+        
+        # Basic settings
+        self.n_users = dataset.user_num
+        self.n_items = dataset.item_num
+        self.n_nodes = self.n_users + self.n_items
         
         self.embedding_dim = config["embedding_size"]
         self.feat_embed_dim = config["feat_embed_dim"]
         self.n_layers = config["n_mm_layers"]
         self.reg_weight = config["reg_weight"]
         self.dropout = config["dropout"]
-        self.temperature = 0.07
+        self.temperature = 0.2
         
-        # Embeddings
+        # Initialize embeddings
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
         self.item_embedding = nn.Embedding(self.n_items, self.embedding_dim)
+        nn.init.xavier_normal_(self.user_embedding.weight)
+        nn.init.xavier_normal_(self.item_embedding.weight)
         
         # Modal encoders
         if self.v_feat is not None:
             self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
-            self.image_encoder = nn.Sequential(
-                nn.Linear(self.v_feat.shape[1], self.feat_embed_dim),
-                nn.LayerNorm(self.feat_embed_dim),
-                nn.GELU(),
-                nn.Dropout(self.dropout)
-            )
+            self.image_encoder = ModalEncoder(self.v_feat.shape[1], self.feat_embed_dim, self.dropout)
             
         if self.t_feat is not None:
             self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
-            self.text_encoder = nn.Sequential(
-                nn.Linear(self.t_feat.shape[1], self.feat_embed_dim),
-                nn.LayerNorm(self.feat_embed_dim),
-                nn.GELU(),
-                nn.Dropout(self.dropout)
-            )
-        
-        # Cross-modal attention
-        self.modal_fusion = ModalFusion(self.feat_embed_dim)
+            self.text_encoder = ModalEncoder(self.t_feat.shape[1], self.feat_embed_dim, self.dropout)
         
         # Graph attention layers
-        self.attention_layers = nn.ModuleList([
-            AttentionLayer(self.embedding_dim) 
+        self.gat_layers = nn.ModuleList([
+            GraphAttention(self.embedding_dim, dropout=self.dropout)
             for _ in range(self.n_layers)
         ])
         
-        # Predictors for InfoNCE loss
-        self.modal_predictor = nn.Sequential(
-            nn.Linear(self.feat_embed_dim, self.feat_embed_dim),
-            nn.GELU(),
-            nn.Linear(self.feat_embed_dim, self.feat_embed_dim)
-        )
-        
+        # Load dataset info
         self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
-        self.build_graph()
+        
+        # Initialize device
         self.to(self.device)
-
-    def build_graph(self):
+        
+        # Build graph structure
+        self.norm_adj = self.build_norm_adj().to(self.device)
+        
+    def build_norm_adj(self):
         adj_mat = sp.dok_matrix((self.n_nodes, self.n_nodes), dtype=np.float32)
         adj_mat = adj_mat.tolil()
         R = self.interaction_matrix.tolil()
@@ -107,90 +117,82 @@ class MMGAT(GeneralRecommender):
         d_mat = sp.diags(d_inv)
         norm_adj = d_mat.dot(adj_mat).dot(d_mat)
         
-        # Convert to PyTorch sparse tensor
         coo = norm_adj.tocoo()
         indices = np.vstack((coo.row, coo.col))
-        i = torch.LongTensor(indices).to(self.device)
-        v = torch.FloatTensor(coo.data).to(self.device)
-        self.norm_adj = torch.sparse_coo_tensor(i, v, coo.shape)
+        i = torch.LongTensor(indices)
+        v = torch.FloatTensor(coo.data)
+        shape = torch.Size(coo.shape)
+        return torch.sparse_coo_tensor(i, v, shape)
 
     def forward(self):
         # Process modalities
-        image_feat = None
-        text_feat = None
+        img_feat, img_pred = None, None
+        txt_feat, txt_pred = None, None
         
         if self.v_feat is not None:
-            image_feat = self.image_encoder(self.image_embedding.weight)
+            img_feat, img_pred = self.image_encoder(self.image_embedding.weight)
             
         if self.t_feat is not None:
-            text_feat = self.text_encoder(self.text_embedding.weight)
+            txt_feat, txt_pred = self.text_encoder(self.text_embedding.weight)
         
-        # Modal fusion with attention
-        if image_feat is not None and text_feat is not None:
-            modal_feat = self.modal_fusion(image_feat, text_feat)
-        else:
-            modal_feat = image_feat if image_feat is not None else text_feat
-            
+        # Combine modal features
+        modal_feat = torch.zeros_like(self.item_embedding.weight)
+        if img_feat is not None:
+            modal_feat = modal_feat + img_feat
+        if txt_feat is not None:
+            modal_feat = modal_feat + txt_feat
+        if img_feat is not None and txt_feat is not None:
+            modal_feat = modal_feat / 2
+        
         # Graph attention with residual connections
-        ego_embeddings = torch.cat([self.user_embedding.weight, self.item_embedding.weight], dim=0)
-        all_embeddings = [ego_embeddings]
+        ego_embeddings = torch.cat([self.user_embedding.weight, self.item_embedding.weight], dim=0).unsqueeze(0)
+        all_embeddings = []
         
-        for layer in self.attention_layers:
-            neighbors = torch.sparse.mm(self.norm_adj, ego_embeddings)
-            ego_embeddings = layer(ego_embeddings, neighbors, neighbors)
-            norm_embeddings = F.normalize(ego_embeddings, p=2, dim=1)
-            all_embeddings.append(norm_embeddings)
-            
-        all_embeddings = torch.stack(all_embeddings, dim=1)
-        all_embeddings = all_embeddings.mean(dim=1)
+        for layer in self.gat_layers:
+            ego_embeddings = layer(ego_embeddings, self.norm_adj)
+            all_embeddings.append(ego_embeddings)
+        
+        all_embeddings = torch.stack(all_embeddings, dim=1).mean(dim=1).squeeze(0)
         user_emb, item_emb = torch.split(all_embeddings, [self.n_users, self.n_items])
         
-        # Add modal information to item embeddings
-        if modal_feat is not None:
-            item_emb = item_emb + modal_feat
-            
-        return user_emb, item_emb, image_feat, text_feat
+        item_emb = item_emb + modal_feat
+        
+        return user_emb, item_emb, (img_feat, img_pred), (txt_feat, txt_pred)
 
     def calculate_loss(self, interaction):
         users = interaction[0]
         pos_items = interaction[1]
         neg_items = interaction[2]
         
-        user_emb, item_emb, img_emb, txt_emb = self.forward()
+        user_emb, item_emb, (img_feat, img_pred), (txt_feat, txt_pred) = self.forward()
         
+        # BPR loss
         u_e = user_emb[users]
         pos_e = item_emb[pos_items]
         neg_e = item_emb[neg_items]
         
-        # InfoNCE loss for recommendation
         pos_scores = torch.sum(u_e * pos_e, dim=1)
         neg_scores = torch.sum(u_e * neg_e, dim=1)
-        rec_loss = -torch.mean(
-            F.logsigmoid(pos_scores / self.temperature - neg_scores / self.temperature)
-        )
+        rec_loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
         
         # Modal contrastive loss
         modal_loss = 0.0
-        if img_emb is not None and txt_emb is not None:
-            img_pred = self.modal_predictor(img_emb[pos_items])
-            txt_pred = self.modal_predictor(txt_emb[pos_items])
-            
-            pos_sim = torch.sum(F.normalize(img_pred, dim=1) * F.normalize(txt_emb[pos_items].detach(), dim=1), dim=1)
-            neg_sim = torch.sum(F.normalize(img_pred, dim=1) * F.normalize(txt_emb[neg_items].detach(), dim=1), dim=1)
-            modal_loss_1 = -torch.mean(F.logsigmoid(pos_sim / self.temperature - neg_sim / self.temperature))
-            
-            pos_sim = torch.sum(F.normalize(txt_pred, dim=1) * F.normalize(img_emb[pos_items].detach(), dim=1), dim=1)
-            neg_sim = torch.sum(F.normalize(txt_pred, dim=1) * F.normalize(img_emb[neg_items].detach(), dim=1), dim=1)
-            modal_loss_2 = -torch.mean(F.logsigmoid(pos_sim / self.temperature - neg_sim / self.temperature))
-            
-            modal_loss = (modal_loss_1 + modal_loss_2) / 2
-        
+        if img_feat is not None and txt_feat is not None:
+            pos_sim = torch.sum(F.normalize(img_feat[pos_items], dim=1) * F.normalize(txt_feat[pos_items], dim=1), dim=1)
+            neg_sim = torch.sum(F.normalize(img_feat[pos_items], dim=1) * F.normalize(txt_feat[neg_items], dim=1), dim=1)
+            modal_loss = -torch.mean(F.logsigmoid((pos_sim - neg_sim) / self.temperature))
+
         # Multi-task regularization
-        reg_loss = self.reg_weight * (
-            torch.norm(u_e) + torch.norm(pos_e) + torch.norm(neg_e)
-        )
+        reg_loss = self.reg_weight * (torch.norm(u_e) + torch.norm(pos_e) + torch.norm(neg_e))
         
-        return rec_loss + 0.1 * modal_loss + reg_loss
+        # Item feature consistency loss
+        feat_loss = 0.0
+        if img_feat is not None:
+            feat_loss += -torch.mean(F.logsigmoid(torch.sum(F.normalize(pos_e, dim=1) * F.normalize(img_feat[pos_items], dim=1), dim=1)))
+        if txt_feat is not None:
+            feat_loss += -torch.mean(F.logsigmoid(torch.sum(F.normalize(pos_e, dim=1) * F.normalize(txt_feat[pos_items], dim=1), dim=1)))
+            
+        return rec_loss + 0.2 * modal_loss + 0.1 * feat_loss + reg_loss
 
     def full_sort_predict(self, interaction):
         user = interaction[0]
