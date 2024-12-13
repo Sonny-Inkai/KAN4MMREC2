@@ -104,7 +104,7 @@ class MMGAT(GeneralRecommender):
         ])
         
         # Adaptive weights
-        self.modal_weight = AdaptiveWeight(0.1)
+        self.modal_weight = AdaptiveWeight(0.001)
         self.reg_adaptation = AdaptiveWeight(0.001)
         
         # Initialize graphs
