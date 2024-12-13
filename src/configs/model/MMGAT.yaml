@@ -10,7 +10,7 @@ n_layers: 2
 dropout: 0.2
 
 # Regularization weights for different components
-reg_weight: 0.001
+reg_weight: 0.01
 
 # Coefficient for multimodal weight
 mm_image_weight: 1.0
