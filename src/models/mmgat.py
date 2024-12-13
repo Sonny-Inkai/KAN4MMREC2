@@ -7,9 +7,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATConv
 from common.abstract_recommender import GeneralRecommender
-# 0.0245 with reg = 0.001, dropout = 0.2    
+
 class ModalEncoder(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.1):
+    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.2):
         super().__init__()
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
@@ -24,7 +24,7 @@ class ModalEncoder(nn.Module):
         return F.normalize(self.encoder(x), p=2, dim=1)
 
 class GraphAttentionLayer(nn.Module):
-    def __init__(self, dim, dropout=0.1):
+    def __init__(self, dim, dropout=0.2):
         super().__init__()
         self.gat = GATConv(dim, dim // 4, heads=4, dropout=dropout)
         self.norm = nn.LayerNorm(dim)
@@ -48,8 +48,8 @@ class MMGAT(GeneralRecommender):
         # User-Item embeddings
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
         self.item_embedding = nn.Embedding(self.n_items, self.embedding_dim)
-        nn.init.normal_(self.user_embedding.weight, std=0.1)
-        nn.init.normal_(self.item_embedding.weight, std=0.1)
+        nn.init.xavier_uniform_(self.user_embedding.weight)
+        nn.init.xavier_uniform_(self.item_embedding.weight)
         
         # Modal encoders
         if self.v_feat is not None:
@@ -178,7 +178,7 @@ class MMGAT(GeneralRecommender):
         modal_loss = 0.0
         if img_emb is not None and txt_emb is not None:
             pos_sim = F.cosine_similarity(img_emb[pos_items], txt_emb[pos_items])
-            neg_sim = F.cosine_similarity(img_emb[neg_items], txt_emb[neg_items])
+            neg_sim = F.cosine_similarity(img_emb[pos_items], txt_emb[neg_items])
             modal_loss = -torch.mean(F.logsigmoid(pos_sim - neg_sim))
         
         # Regularization loss
