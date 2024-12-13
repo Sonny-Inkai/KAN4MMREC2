@@ -27,6 +27,7 @@ class CrossModalAttention(nn.Module):
     def __init__(self, dim, dropout=0.1):
         super().__init__()
         self.attention = nn.MultiheadAttention(dim, num_heads=4, dropout=dropout, batch_first=True)
+        self.projection = nn.Linear(dim * 2, dim)  # Project concatenated tensor back to original dimension
         self.norm = nn.LayerNorm(dim)
         self.dropout = nn.Dropout(dropout)
         
@@ -34,7 +35,9 @@ class CrossModalAttention(nn.Module):
         h1, _ = self.attention(x1.unsqueeze(1), x2.unsqueeze(1), x2.unsqueeze(1))
         h2, _ = self.attention(x2.unsqueeze(1), x1.unsqueeze(1), x1.unsqueeze(1))
         h = torch.cat([h1.squeeze(1), h2.squeeze(1)], dim=1)
+        h = self.projection(h)  # Project back to original dimension
         return self.norm(h + self.dropout(h))
+
 
 class MMGAT(GeneralRecommender):
     def __init__(self, config, dataset):
