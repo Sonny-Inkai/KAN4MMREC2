@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATConv
 from common.abstract_recommender import GeneralRecommender
-
+# 0.0245 with reg = 0.001, dropout = 0.2    
 class ModalEncoder(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.1):
         super().__init__()
@@ -45,28 +45,20 @@ class MMGAT(GeneralRecommender):
         self.reg_weight = config["reg_weight"]
         self.knn_k = config["knn_k"]
         
-        # Initialize embeddings
+        # User-Item embeddings
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
         self.item_embedding = nn.Embedding(self.n_items, self.embedding_dim)
         nn.init.normal_(self.user_embedding.weight, std=0.1)
         nn.init.normal_(self.item_embedding.weight, std=0.1)
         
-        # Modal networks
+        # Modal encoders
         if self.v_feat is not None:
             self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
-            self.image_trs = nn.Sequential(
-                nn.Linear(self.v_feat.shape[1], self.feat_embed_dim),
-                nn.LayerNorm(self.feat_embed_dim),
-                nn.GELU()
-            )
+            self.image_encoder = ModalEncoder(self.v_feat.shape[1], self.hidden_dim, self.feat_embed_dim, self.dropout)
             
         if self.t_feat is not None:
             self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
-            self.text_trs = nn.Sequential(
-                nn.Linear(self.t_feat.shape[1], self.feat_embed_dim),
-                nn.LayerNorm(self.feat_embed_dim),
-                nn.GELU()
-            )
+            self.text_encoder = ModalEncoder(self.t_feat.shape[1], self.hidden_dim, self.feat_embed_dim, self.dropout)
             
         # Graph layers
         self.mm_layers = nn.ModuleList([
@@ -111,15 +103,16 @@ class MMGAT(GeneralRecommender):
         if self.v_feat is None and self.t_feat is None:
             return
             
-        feat = None
         if self.v_feat is not None:
-            feat = F.normalize(self.v_feat, p=2, dim=1)
-        if self.t_feat is not None:
-            feat = F.normalize(self.t_feat, p=2, dim=1)
+            feats = F.normalize(self.v_feat, p=2, dim=1)
+            sim = torch.mm(feats, feats.t())
             
-        sim = torch.mm(feat, feat.t())
+        if self.t_feat is not None:
+            feats = F.normalize(self.t_feat, p=2, dim=1)
+            sim = torch.mm(feats, feats.t())
+        
         values, indices = sim.topk(k=self.knn_k, dim=1)
-        rows = torch.arange(feat.size(0), device=self.device).view(-1, 1).expand_as(indices)
+        rows = torch.arange(feats.size(0), device=self.device).view(-1, 1).expand_as(indices)
         
         self.mm_edge_index = torch.stack([
             torch.cat([rows.reshape(-1), indices.reshape(-1)]),
@@ -128,23 +121,23 @@ class MMGAT(GeneralRecommender):
 
     def forward(self):
         # Process modalities
-        img_feat = txt_feat = None
+        img_emb = txt_emb = None
         
         if self.v_feat is not None:
-            img_feat = self.image_trs(self.image_embedding.weight)
+            img_emb = self.image_encoder(self.image_embedding.weight)
             for layer in self.mm_layers:
-                img_feat = layer(img_feat, self.mm_edge_index)
+                img_emb = layer(img_emb, self.mm_edge_index)
                 
         if self.t_feat is not None:
-            txt_feat = self.text_trs(self.text_embedding.weight)
+            txt_emb = self.text_encoder(self.text_embedding.weight)
             for layer in self.mm_layers:
-                txt_feat = layer(txt_feat, self.mm_edge_index)
+                txt_emb = layer(txt_emb, self.mm_edge_index)
         
         # Fuse modalities
-        if img_feat is not None and txt_feat is not None:
-            modal_emb = self.fusion(torch.cat([img_feat, txt_feat], dim=1))
+        if img_emb is not None and txt_emb is not None:
+            modal_emb = self.fusion(torch.cat([img_emb, txt_emb], dim=1))
         else:
-            modal_emb = img_feat if img_feat is not None else txt_feat
+            modal_emb = img_emb if img_emb is not None else txt_emb
         
         # Process user-item graph
         x = torch.cat([self.user_embedding.weight, self.item_embedding.weight])
@@ -156,55 +149,46 @@ class MMGAT(GeneralRecommender):
             x = layer(x, self.edge_index)
             all_embs.append(x)
             
-        x = torch.stack(all_embs, dim=1)
-        x = torch.mean(x, dim=1)
-        
+        x = torch.stack(all_embs, dim=1).mean(dim=1)
         user_emb, item_emb = torch.split(x, [self.n_users, self.n_items])
         
+        # Combine with modal embeddings
         if modal_emb is not None:
             item_emb = item_emb + modal_emb
             
-        return user_emb, item_emb, img_feat, txt_feat
+        return user_emb, item_emb, img_emb, txt_emb
 
     def calculate_loss(self, interaction):
         users = interaction[0]
         pos_items = interaction[1]
         neg_items = interaction[2]
         
-        ua_embeddings, ia_embeddings, img_feat, txt_feat = self.forward()
+        user_emb, item_emb, img_emb, txt_emb = self.forward()
+        
+        u_emb = user_emb[users]
+        pos_emb = item_emb[pos_items]
+        neg_emb = item_emb[neg_items]
         
         # BPR loss
-        u_g_embeddings = ua_embeddings[users]
-        pos_i_g_embeddings = ia_embeddings[pos_items]
-        neg_i_g_embeddings = ia_embeddings[neg_items]
+        pos_scores = torch.sum(u_emb * pos_emb, dim=1)
+        neg_scores = torch.sum(u_emb * neg_emb, dim=1)
+        mf_loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
         
-        batch_mf_loss = self.bpr_loss(u_g_embeddings, pos_i_g_embeddings, neg_i_g_embeddings)
+        # Modal contrastive loss
+        modal_loss = 0.0
+        if img_emb is not None and txt_emb is not None:
+            pos_sim = F.cosine_similarity(img_emb[pos_items], txt_emb[pos_items])
+            neg_sim = F.cosine_similarity(img_emb[pos_items], txt_emb[neg_items])
+            modal_loss = -torch.mean(F.logsigmoid(pos_sim - neg_sim))
         
-        # Modal-specific losses
-        mf_v_loss, mf_t_loss = 0.0, 0.0
+        # Regularization loss
+        reg_loss = self.reg_weight * (
+            torch.norm(u_emb) +
+            torch.norm(pos_emb) +
+            torch.norm(neg_emb)
+        )
         
-        if self.t_feat is not None:
-            text_feats = self.text_trs(self.text_embedding.weight)
-            mf_t_loss = self.bpr_loss(
-                ua_embeddings[users],
-                text_feats[pos_items],
-                text_feats[neg_items]
-            )
-            
-        if self.v_feat is not None:
-            image_feats = self.image_trs(self.image_embedding.weight)
-            mf_v_loss = self.bpr_loss(
-                ua_embeddings[users],
-                image_feats[pos_items],
-                image_feats[neg_items]
-            )
-            
-        return batch_mf_loss + self.reg_weight * (mf_t_loss + mf_v_loss)
-        
-    def bpr_loss(self, users, pos_items, neg_items):
-        pos_scores = torch.sum(users * pos_items, dim=1)
-        neg_scores = torch.sum(users * neg_items, dim=1)
-        return -torch.mean(F.logsigmoid(pos_scores - neg_scores))
+        return mf_loss + 0.1 * modal_loss + reg_loss
 
     def full_sort_predict(self, interaction):
         user = interaction[0]
