@@ -72,7 +72,6 @@ class GraphAttentionLayer(nn.Module):
         )
         
     def forward(self, x, edge_index, edge_weight=None):
-        # Residual connection
         residual = x
         x = self.norm(x + self.dropout(self.gat(x, edge_index, edge_weight)))
         x = self.norm(x + self.dropout(self.ffn(x)))
@@ -89,9 +88,9 @@ class MMGAT(GeneralRecommender):
         self.dropout = config["dropout"]
         self.reg_weight = config["reg_weight"]
         self.knn_k = config["knn_k"]
-        self.temp = 0.07  # Temperature parameter for contrastive loss
+        self.temp = 0.07
         
-        # User-Item embeddings with better initialization
+        # User-Item embeddings
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
         self.item_embedding = nn.Embedding(self.n_items, self.embedding_dim)
         self.apply(self._init_weights)
@@ -105,7 +104,7 @@ class MMGAT(GeneralRecommender):
             self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
             self.text_encoder = ModalEncoder(self.t_feat.shape[1], self.hidden_dim, self.feat_embed_dim, self.dropout)
         
-        # Cross-modal attention for better fusion
+        # Cross-modal fusion
         if self.v_feat is not None and self.t_feat is not None:
             self.cross_attention = CrossModalAttention(self.feat_embed_dim)
             self.fusion = nn.Sequential(
@@ -117,7 +116,7 @@ class MMGAT(GeneralRecommender):
                 nn.LayerNorm(self.feat_embed_dim)
             )
         
-        # Graph layers with residual connections
+        # Graph layers
         self.mm_layers = nn.ModuleList([
             GraphAttentionLayer(self.feat_embed_dim, dropout=self.dropout)
             for _ in range(self.n_layers)
@@ -128,7 +127,10 @@ class MMGAT(GeneralRecommender):
             for _ in range(self.n_layers)
         ])
         
-        # Load and process interaction data
+        # Layer aggregation weights
+        self.layer_weights = nn.Parameter(torch.ones(self.n_layers + 1))
+        
+        # Load data
         self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
         self.edge_index = self.build_edges()
         self.edge_weight = None
@@ -143,7 +145,7 @@ class MMGAT(GeneralRecommender):
             module.weight.data.normal_(mean=0.0, std=0.02)
             if isinstance(module, nn.Linear) and module.bias is not None:
                 module.bias.data.zero_()
-    
+
     def build_edges(self):
         rows = self.interaction_matrix.row
         cols = self.interaction_matrix.col + self.n_users
@@ -153,7 +155,6 @@ class MMGAT(GeneralRecommender):
             np.concatenate([cols, rows])
         ]), dtype=torch.long).to(self.device)
         
-        # Calculate edge weights based on interaction frequency
         values = torch.ones(edge_index.size(1)).to(self.device)
         self.edge_weight = values
         
@@ -168,7 +169,6 @@ class MMGAT(GeneralRecommender):
         if self.t_feat is not None:
             feats = F.normalize(self.t_feat, p=2, dim=1)
             
-        # Build KNN graph with cosine similarity
         sim = torch.mm(feats, feats.t())
         values, indices = sim.topk(k=self.knn_k, dim=1)
         rows = torch.arange(feats.size(0), device=self.device).view(-1, 1).expand_as(indices)
@@ -178,11 +178,9 @@ class MMGAT(GeneralRecommender):
             torch.cat([indices.reshape(-1), rows.reshape(-1)])
         ]).to(self.device)
         
-        # Edge weights based on similarity scores
         self.mm_edge_weight = torch.cat([values.reshape(-1), values.reshape(-1)]).to(self.device)
 
     def forward(self):
-        # Process modalities with enhanced encoders
         img_emb = txt_emb = None
         
         if self.v_feat is not None:
@@ -191,23 +189,20 @@ class MMGAT(GeneralRecommender):
         if self.t_feat is not None:
             txt_emb = self.text_encoder(self.text_embedding.weight)
         
-        # Modal fusion with cross-attention
+        # Modal fusion
         if img_emb is not None and txt_emb is not None:
-            # Cross-modal attention
             img_attended = self.cross_attention(img_emb.unsqueeze(0), txt_emb.unsqueeze(0), txt_emb.unsqueeze(0)).squeeze(0)
             txt_attended = self.cross_attention(txt_emb.unsqueeze(0), img_emb.unsqueeze(0), img_emb.unsqueeze(0)).squeeze(0)
-            
-            # Combine attended features
             modal_emb = self.fusion(torch.cat([img_attended, txt_attended], dim=1))
         else:
             modal_emb = img_emb if img_emb is not None else txt_emb
         
-        # Apply modal graph attention with edge weights
+        # Process modal embeddings
         if modal_emb is not None:
             for layer in self.mm_layers:
                 modal_emb = layer(modal_emb, self.mm_edge_index, self.mm_edge_weight)
         
-        # Process user-item graph with enhanced attention
+        # Process user-item graph
         x = torch.cat([self.user_embedding.weight, self.item_embedding.weight])
         all_embs = [x]
         
@@ -216,15 +211,15 @@ class MMGAT(GeneralRecommender):
                 x = F.dropout(x, p=self.dropout)
             x = layer(x, self.edge_index, self.edge_weight)
             all_embs.append(x)
-            
-        # Aggregate embeddings with learned weights
-        weights = F.softmax(torch.randn(len(all_embs)).to(self.device), dim=0)
-        x = torch.stack(all_embs, dim=1) @ weights.view(-1, 1)
-        x = x.squeeze(1)
+        
+        # Weighted aggregation of layers
+        weights = F.softmax(self.layer_weights, dim=0)
+        all_embs = torch.stack(all_embs, dim=0)  # [n_layers+1, n_nodes, embedding_dim]
+        x = (all_embs * weights.view(-1, 1, 1)).sum(dim=0)  # [n_nodes, embedding_dim]
         
         user_emb, item_emb = torch.split(x, [self.n_users, self.n_items])
         
-        # Combine with modal embeddings using residual connection
+        # Combine with modal embeddings
         if modal_emb is not None:
             item_emb = item_emb + F.normalize(modal_emb, p=2, dim=1)
             
@@ -241,16 +236,15 @@ class MMGAT(GeneralRecommender):
         pos_emb = item_emb[pos_items]
         neg_emb = item_emb[neg_items]
         
-        # BPR loss with hard negative mining
+        # InfoNCE loss
         pos_scores = torch.sum(u_emb * pos_emb, dim=1)
         neg_scores = torch.sum(u_emb * neg_emb, dim=1)
         
-        # InfoNCE loss for better contrast
         pos_exp = torch.exp(pos_scores / self.temp)
         neg_exp = torch.exp(neg_scores / self.temp)
         mf_loss = -torch.mean(torch.log(pos_exp / (pos_exp + neg_exp)))
         
-        # Modal contrastive loss with momentum
+        # Modal contrastive loss
         modal_loss = 0.0
         if img_emb is not None and txt_emb is not None:
             img_pos = F.normalize(img_emb[pos_items], p=2, dim=1)
@@ -263,14 +257,13 @@ class MMGAT(GeneralRecommender):
             
             modal_loss = -torch.mean(torch.log(torch.exp(pos_sim) / (torch.exp(pos_sim) + torch.exp(neg_sim))))
         
-        # L2 regularization with gradient clipping
+        # Regularization
         reg_loss = self.reg_weight * (
             torch.norm(u_emb) +
             torch.norm(pos_emb) +
             torch.norm(neg_emb)
         )
         
-        # Combine losses with dynamic weighting
         total_loss = mf_loss + 0.2 * modal_loss + reg_loss
         
         # Gradient clipping
@@ -281,7 +274,5 @@ class MMGAT(GeneralRecommender):
     def full_sort_predict(self, interaction):
         user = interaction[0]
         user_emb, item_emb, _, _ = self.forward()
-        
-        # Compute scores with temperature scaling
         scores = torch.matmul(user_emb[user], item_emb.transpose(0, 1)) / self.temp
         return scores
