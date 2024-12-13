@@ -56,7 +56,7 @@ class MMGAT(GeneralRecommender):
         self.feat_embed_dim = config["feat_embed_dim"]
         self.hidden_dim = self.feat_embed_dim * 4
         self.n_layers = config["n_mm_layers"]
-        self.dropout = 0.6  # Increased dropout
+        self.dropout = 0.6
         self.reg_weight = config["reg_weight"]
         self.knn_k = config["knn_k"]
         
@@ -74,7 +74,6 @@ class MMGAT(GeneralRecommender):
             self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
             self.text_encoder = ModalEncoder(self.t_feat.shape[1], self.hidden_dim, self.feat_embed_dim, self.dropout)
         
-        # Cross-modal fusion
         if self.v_feat is not None and self.t_feat is not None:
             self.cross_modal_attention = CrossModalAttention(self.feat_embed_dim)
             self.modal_fusion = nn.Sequential(
@@ -84,19 +83,16 @@ class MMGAT(GeneralRecommender):
                 nn.Dropout(self.dropout)
             )
 
-        # Graph layers
         self.graph_layers = nn.ModuleList([
             GraphAttentionLayer(self.embedding_dim, self.dropout)
             for _ in range(self.n_layers)
         ])
         
-        # Load data
         self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
         self.edge_index, self.edge_weight = self.build_graph()
         self.mm_edge_index = None
         self.build_modal_graph()
         
-        # Additional projections
         self.modal_proj = nn.Linear(self.feat_embed_dim, self.embedding_dim)
         self.predictor = nn.Linear(self.embedding_dim, self.embedding_dim)
         
@@ -111,7 +107,6 @@ class MMGAT(GeneralRecommender):
             np.concatenate([cols, rows])
         ]), dtype=torch.long).to(self.device)
         
-        # Compute edge weights based on degree
         deg = np.bincount(rows)
         deg_inv_sqrt = np.power(deg + 1e-12, -0.5)
         row_weight = deg_inv_sqrt[rows]
@@ -126,7 +121,7 @@ class MMGAT(GeneralRecommender):
     def build_modal_graph(self):
         if not (self.v_feat is not None or self.t_feat is not None):
             return
-            
+        
         if self.v_feat is not None and self.t_feat is not None:
             v_feat = F.normalize(self.v_feat, p=2, dim=1)
             t_feat = F.normalize(self.t_feat, p=2, dim=1)
@@ -140,15 +135,14 @@ class MMGAT(GeneralRecommender):
             sim = torch.mm(feats, feats.t())
             
         values, indices = sim.topk(k=self.knn_k, dim=1)
-        rows = torch.arange(sim.size(0)).view(-1, 1).expand_as(indices)
+        rows = torch.arange(sim.size(0), device=self.device).view(-1, 1).expand_as(indices)
         
         self.mm_edge_index = torch.stack([
             torch.cat([rows.reshape(-1), indices.reshape(-1)]),
             torch.cat([indices.reshape(-1), rows.reshape(-1)])
-        ]).to(self.device)
+        ])
 
     def forward(self):
-        # Process modalities
         modal_emb = None
         if self.v_feat is not None:
             img_emb = self.image_encoder(self.image_embedding.weight)
@@ -159,17 +153,14 @@ class MMGAT(GeneralRecommender):
             if modal_emb is None:
                 modal_emb = txt_emb
             else:
-                # Cross-modal attention fusion
                 img_emb = self.cross_modal_attention(img_emb.unsqueeze(0), txt_emb.unsqueeze(0), txt_emb.unsqueeze(0))
                 txt_emb = self.cross_modal_attention(txt_emb.unsqueeze(0), img_emb.unsqueeze(0), img_emb.unsqueeze(0))
                 modal_emb = self.modal_fusion(torch.cat([img_emb.squeeze(0), txt_emb.squeeze(0)], dim=-1))
 
-        # Project modal embeddings
         if modal_emb is not None:
             modal_emb = self.modal_proj(modal_emb)
             modal_emb = F.normalize(modal_emb, p=2, dim=1)
 
-        # Process user-item graph
         x = torch.cat([self.user_embedding, self.item_embedding])
         all_embs = [x]
 
@@ -182,7 +173,6 @@ class MMGAT(GeneralRecommender):
         x = torch.stack(all_embs, dim=1).mean(dim=1)
         user_emb, item_emb = torch.split(x, [self.n_users, self.n_items])
 
-        # Combine with modal embeddings
         if modal_emb is not None:
             item_emb = item_emb + F.dropout(modal_emb, p=self.dropout, training=self.training)
 
@@ -202,13 +192,11 @@ class MMGAT(GeneralRecommender):
         pos_emb = item_emb[pos_items]
         neg_emb = item_emb[neg_items]
         
-        # BPR loss with temperature scaling
         pos_scores = torch.sum(u_emb * pos_emb, dim=1)
         neg_scores = torch.sum(u_emb * neg_emb, dim=1)
         
         loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
 
-        # L2 regularization
         reg_loss = self.reg_weight * (
             torch.norm(u_emb) +
             torch.norm(pos_emb) +
