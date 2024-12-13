@@ -34,7 +34,7 @@ class ModalEncoder(nn.Module):
         return h, z
 
 class GraphAttentionAggregator(nn.Module):
-    def __init__(self, dim, heads=4, dropout=0.1):
+    def __init__(self, dim, heads=8, dropout=0.1):
         super().__init__()
         self.gat = GATConv(dim, dim // heads, heads=heads, dropout=dropout)
         self.norm = nn.LayerNorm(dim)
