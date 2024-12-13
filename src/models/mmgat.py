@@ -82,7 +82,7 @@ class MMGAT(GeneralRecommender):
         
         self.embedding_dim = config["embedding_size"]
         self.feat_embed_dim = config["feat_embed_dim"]
-        self.hidden_dim = self.feat_embed_dim * 4
+        self.hidden_dim = self.feat_embed_dim * 2
         self.n_layers = config["n_mm_layers"]
         self.dropout = config["dropout"]
         self.reg_weight = config["reg_weight"]
