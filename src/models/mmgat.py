@@ -178,7 +178,7 @@ class MMGAT(GeneralRecommender):
         modal_loss = 0.0
         if img_emb is not None and txt_emb is not None:
             pos_sim = F.cosine_similarity(img_emb[pos_items], txt_emb[pos_items])
-            neg_sim = F.cosine_similarity(img_emb[pos_items], txt_emb[neg_items])
+            neg_sim = F.cosine_similarity(img_emb[neg_items], txt_emb[neg_items])
             modal_loss = -torch.mean(F.logsigmoid(pos_sim - neg_sim))
         
         # Regularization loss
