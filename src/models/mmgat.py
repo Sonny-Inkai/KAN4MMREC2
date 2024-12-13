@@ -76,8 +76,8 @@ class MMGAT(GeneralRecommender):
         self.item_embedding = nn.Embedding(self.n_items, self.embedding_dim)
         
         # Initialize with smaller values to prevent saturation
-        nn.init.xavier_uniform_(self.user_embedding.weight, mean=0.0, std=0.02)
-        nn.init.xavier_uniform_(self.item_embedding.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.user_embedding.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.item_embedding.weight, mean=0.0, std=0.02)
         
         # Modal encoders
         if self.v_feat is not None:
