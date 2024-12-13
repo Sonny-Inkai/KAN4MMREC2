@@ -104,8 +104,8 @@ class MMGAT(GeneralRecommender):
         ])
         
         # Adaptive weights
-        self.modal_weight = AdaptiveWeight(0.5)
-        self.reg_adaptation = AdaptiveWeight(0.1)
+        self.modal_weight = AdaptiveWeight(0.1)
+        self.reg_adaptation = AdaptiveWeight(0.001)
         
         # Initialize graphs
         self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
