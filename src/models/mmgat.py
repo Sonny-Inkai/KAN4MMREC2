@@ -60,7 +60,7 @@ class MultiModalFusion(nn.Module):
         )
         
     def forward(self, img_emb, txt_emb):
-        # Dynamic modal attention
+        # Ensure same dimensions for both modalities
         combined = torch.cat([img_emb, txt_emb], dim=1)
         weights = self.attention(combined)
         weighted = torch.cat([
@@ -81,24 +81,24 @@ class MMGAT(GeneralRecommender):
         self.reg_weight = config["reg_weight"]
         self.knn_k = config["knn_k"]
         
-        # User-Item embeddings with better initialization
+        # User-Item embeddings
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
         self.item_embedding = nn.Embedding(self.n_items, self.embedding_dim)
         nn.init.xavier_uniform_(self.user_embedding.weight, gain=1.0)
         nn.init.xavier_uniform_(self.item_embedding.weight, gain=1.0)
         
-        # Modal encoders
+        # Modal encoders - ensure output dimension matches embedding_dim
         if self.v_feat is not None:
             self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
-            self.image_encoder = ModalEncoder(self.v_feat.shape[1], self.hidden_dim, self.feat_embed_dim, self.dropout)
+            self.image_encoder = ModalEncoder(self.v_feat.shape[1], self.hidden_dim, self.embedding_dim, self.dropout)
             
         if self.t_feat is not None:
             self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
-            self.text_encoder = ModalEncoder(self.t_feat.shape[1], self.hidden_dim, self.feat_embed_dim, self.dropout)
+            self.text_encoder = ModalEncoder(self.t_feat.shape[1], self.hidden_dim, self.embedding_dim, self.dropout)
             
-        # Graph layers with residual connections and layer normalization
+        # Graph layers
         self.mm_layers = nn.ModuleList([
-            GraphAttentionLayer(self.feat_embed_dim, heads=4, dropout=self.dropout)
+            GraphAttentionLayer(self.embedding_dim, heads=4, dropout=self.dropout)
             for _ in range(self.n_layers)
         ])
         
@@ -107,9 +107,12 @@ class MMGAT(GeneralRecommender):
             for _ in range(self.n_layers)
         ])
         
-        # Enhanced modal fusion with attention
+        # Modal fusion
         if self.v_feat is not None and self.t_feat is not None:
-            self.fusion = MultiModalFusion(self.feat_embed_dim, self.dropout)
+            self.fusion = MultiModalFusion(self.embedding_dim, self.dropout)
+            
+        # Final projection to ensure consistent dimensions
+        self.final_projection = nn.Linear(self.embedding_dim, self.embedding_dim)
         
         # Load data
         self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
@@ -117,44 +120,12 @@ class MMGAT(GeneralRecommender):
         self.mm_edge_index = None
         self.build_modal_graph()
         
-        # Temperature parameter for InfoNCE loss
         self.temp = nn.Parameter(torch.FloatTensor([0.07]))
         
         self.to(self.device)
 
-    def build_edges(self):
-        rows = self.interaction_matrix.row
-        cols = self.interaction_matrix.col + self.n_users
-        
-        edge_index = torch.tensor(np.vstack([
-            np.concatenate([rows, cols]),
-            np.concatenate([cols, rows])
-        ]), dtype=torch.long).to(self.device)
-        
-        return edge_index
-
-    def build_modal_graph(self):
-        if self.v_feat is None and self.t_feat is None:
-            return
-            
-        if self.v_feat is not None:
-            feats = F.normalize(self.v_feat, p=2, dim=1)
-            sim = torch.mm(feats, feats.t())
-            
-        if self.t_feat is not None:
-            feats = F.normalize(self.t_feat, p=2, dim=1)
-            sim = torch.mm(feats, feats.t())
-        
-        values, indices = sim.topk(k=self.knn_k, dim=1)
-        rows = torch.arange(feats.size(0), device=self.device).view(-1, 1).expand_as(indices)
-        
-        self.mm_edge_index = torch.stack([
-            torch.cat([rows.reshape(-1), indices.reshape(-1)]),
-            torch.cat([indices.reshape(-1), rows.reshape(-1)])
-        ]).to(self.device)
-
     def forward(self):
-        # Process modalities with residual connections
+        # Process modalities
         img_emb = txt_emb = None
         
         if self.v_feat is not None:
@@ -171,13 +142,13 @@ class MMGAT(GeneralRecommender):
                 txt_emb = layer(txt_emb, self.mm_edge_index)
             txt_emb = txt_emb + txt_res
         
-        # Enhanced fusion with attention
+        # Fusion with matching dimensions
         if img_emb is not None and txt_emb is not None:
             modal_emb = self.fusion(img_emb, txt_emb)
         else:
             modal_emb = img_emb if img_emb is not None else txt_emb
         
-        # Process user-item graph with skip connections
+        # Process user-item graph
         x = torch.cat([self.user_embedding.weight, self.item_embedding.weight])
         x_res = x
         all_embs = [x]
@@ -191,9 +162,9 @@ class MMGAT(GeneralRecommender):
         x = torch.stack(all_embs, dim=1).mean(dim=1) + x_res
         user_emb, item_emb = torch.split(x, [self.n_users, self.n_items])
         
-        # Combine with modal embeddings using gating
+        # Combine with modal embeddings using element-wise gating
         if modal_emb is not None:
-            gate = torch.sigmoid(item_emb @ modal_emb.t())
+            gate = torch.sigmoid(self.final_projection(item_emb))
             item_emb = item_emb + gate * modal_emb
             
         return user_emb, item_emb, img_emb, txt_emb
