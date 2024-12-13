@@ -11,21 +11,28 @@ class HierarchicalEncoder(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, num_levels=3, dropout=0.1):
         super().__init__()
         self.num_levels = num_levels
-        dims = [input_dim] + [hidden_dim] * (num_levels-1) + [output_dim]
+        self.output_dim = output_dim
         
-        self.level_encoders = nn.ModuleList([
+        self.input_transform = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+        
+        self.level_transforms = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(dims[i], dims[i+1]),
-                nn.LayerNorm(dims[i+1]),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
                 nn.GELU(),
                 nn.Dropout(dropout)
-            ) for i in range(num_levels)
+            ) for _ in range(num_levels)
         ])
         
-        self.level_attentions = nn.ModuleList([
-            nn.MultiheadAttention(dims[i+1], 4, dropout=dropout)
-            for i in range(num_levels-1)
-        ])
+        self.output_transform = nn.Sequential(
+            nn.Linear(hidden_dim, output_dim),
+            nn.LayerNorm(output_dim)
+        )
         
         self.predictor = nn.Sequential(
             nn.Linear(output_dim, output_dim),
@@ -34,45 +41,22 @@ class HierarchicalEncoder(nn.Module):
         )
         
     def forward(self, x):
-        level_outputs = []
-        current = x
+        # Initial transform
+        h = self.input_transform(x)
+        hidden_states = []
         
-        for i in range(self.num_levels):
-            current = self.level_encoders[i](current)
-            if i < self.num_levels - 1:
-                attn_out, _ = self.level_attentions[i](
-                    current.unsqueeze(0),
-                    current.unsqueeze(0),
-                    current.unsqueeze(0)
-                )
-                current = current + attn_out.squeeze(0)
-            level_outputs.append(current)
+        # Multi-level feature extraction
+        current = h
+        for transform in self.level_transforms:
+            current = transform(current) + current
+            hidden_states.append(current)
             
-        output = sum(level_outputs) / len(level_outputs)
+        # Aggregate all levels
+        multi_level = torch.stack(hidden_states).mean(0)
+        
+        # Project to output space
+        output = self.output_transform(multi_level)
         return output, self.predictor(output.detach())
-
-class SemanticAggregator(nn.Module):
-    def __init__(self, dim, num_heads=4):
-        super().__init__()
-        self.attention = nn.MultiheadAttention(dim, num_heads)
-        self.gru = nn.GRU(dim, dim, batch_first=True)
-        self.norm = nn.LayerNorm(dim)
-        
-    def forward(self, x, adj):
-        # Graph propagation with semantic attention
-        h = torch.mm(adj, x)
-        
-        # Self-attention for semantic refinement
-        attn_out, _ = self.attention(
-            h.unsqueeze(0), h.unsqueeze(0), h.unsqueeze(0)
-        )
-        h = h + attn_out.squeeze(0)
-        
-        # Sequential refinement
-        h, _ = self.gru(h.unsqueeze(0))
-        h = h.squeeze(0)
-        
-        return self.norm(h + x)
 
 class MMGAT(GeneralRecommender):
     def __init__(self, config, dataset):
@@ -86,7 +70,7 @@ class MMGAT(GeneralRecommender):
         self.dropout = config["dropout"]
         self.knn_k = config["knn_k"]
         
-        # Core embeddings
+        # Embeddings
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
         self.item_embedding = nn.Embedding(self.n_items, self.embedding_dim)
         nn.init.normal_(self.user_embedding.weight, std=0.1)
@@ -105,31 +89,23 @@ class MMGAT(GeneralRecommender):
                 self.t_feat.shape[1], self.hidden_dim, self.feat_embed_dim
             )
         
-        # Semantic aggregators
-        self.semantic_layers = nn.ModuleList([
-            SemanticAggregator(self.feat_embed_dim)
-            for _ in range(self.n_layers)
-        ])
+        # Modal fusion
+        if self.v_feat is not None and self.t_feat is not None:
+            self.fusion = nn.Sequential(
+                nn.Linear(self.feat_embed_dim * 2, self.feat_embed_dim),
+                nn.LayerNorm(self.feat_embed_dim),
+                nn.GELU(),
+                nn.Dropout(self.dropout)
+            )
         
-        # Cross-modal integration
-        self.modal_fusion = nn.Sequential(
-            nn.Linear(self.feat_embed_dim * 2, self.feat_embed_dim),
-            nn.LayerNorm(self.feat_embed_dim),
-            nn.GELU()
-        )
-        
-        # Load data
         self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
         self.norm_adj = self.get_norm_adj_mat().to(self.device)
-        
-        # Build semantic graphs
         self.modal_adj = None
-        self.build_semantic_graphs()
+        self.build_modal_graph()
         
         self.to(self.device)
         
     def get_norm_adj_mat(self):
-        # Build user-item adjacency matrix
         A = sp.dok_matrix((self.n_users + self.n_items, self.n_users + self.n_items), dtype=np.float32)
         inter_M = self.interaction_matrix
         inter_M_t = self.interaction_matrix.transpose()
@@ -138,7 +114,6 @@ class MMGAT(GeneralRecommender):
         for key, value in data_dict.items():
             A[key] = value
         
-        # Normalize adjacency matrix
         sumArr = (A > 0).sum(axis=1)
         diag = np.array(sumArr.flatten())[0] + 1e-7
         diag = np.power(diag, -0.5)
@@ -150,31 +125,28 @@ class MMGAT(GeneralRecommender):
         i = torch.LongTensor(indices)
         v = torch.FloatTensor(L.data)
         return torch.sparse_coo_tensor(i, v, L.shape)
-
-    def build_semantic_graphs(self):
-        adj_matrices = []
         
+    def build_modal_graph(self):
         if self.v_feat is not None:
             v_feat = F.normalize(self.v_feat, p=2, dim=1)
             v_sim = torch.mm(v_feat, v_feat.t())
-            adj_matrices.append(self.compute_semantic_adj(v_sim))
+            self.modal_adj = self.compute_graph(v_sim)
             
         if self.t_feat is not None:
             t_feat = F.normalize(self.t_feat, p=2, dim=1)
             t_sim = torch.mm(t_feat, t_feat.t())
-            adj_matrices.append(self.compute_semantic_adj(t_sim))
-        
-        if len(adj_matrices) > 0:
-            self.modal_adj = sum(adj_matrices) / len(adj_matrices)
-        
-    def compute_semantic_adj(self, sim_matrix):
-        # KNN graph construction
+            if self.modal_adj is None:
+                self.modal_adj = self.compute_graph(t_sim)
+            else:
+                t_adj = self.compute_graph(t_sim)
+                self.modal_adj = 0.5 * (self.modal_adj + t_adj)
+                
+    def compute_graph(self, sim_matrix):
         values, indices = sim_matrix.topk(k=self.knn_k, dim=1)
         rows = torch.arange(sim_matrix.size(0)).view(-1, 1).expand_as(indices)
         adj = torch.zeros_like(sim_matrix)
         adj[rows.reshape(-1), indices.reshape(-1)] = values.reshape(-1)
         
-        # Symmetric normalization
         adj = (adj + adj.t()) / 2
         deg = torch.sum(adj, dim=1)
         deg_inv_sqrt = torch.pow(deg + 1e-12, -0.5)
@@ -182,42 +154,38 @@ class MMGAT(GeneralRecommender):
         return norm_adj.to(self.device)
 
     def forward(self):
-        # Process modalities with hierarchical encoding
+        # Process modalities
         img_feat = img_pred = txt_feat = txt_pred = None
         
         if self.v_feat is not None:
             img_feat, img_pred = self.image_encoder(self.image_embedding.weight)
-            
+            for _ in range(self.n_layers):
+                img_feat = F.normalize(torch.mm(self.modal_adj, img_feat))
+                
         if self.t_feat is not None:
             txt_feat, txt_pred = self.text_encoder(self.text_embedding.weight)
+            for _ in range(self.n_layers):
+                txt_feat = F.normalize(torch.mm(self.modal_adj, txt_feat))
         
-        # Semantic aggregation
-        modal_feat = None
+        # Fuse modalities
         if img_feat is not None and txt_feat is not None:
-            modal_cat = torch.cat([img_feat, txt_feat], dim=1)
-            modal_feat = self.modal_fusion(modal_cat)
-            
-            # Apply semantic aggregation
-            for layer in self.semantic_layers:
-                modal_feat = layer(modal_feat, self.modal_adj)
+            modal_feat = self.fusion(torch.cat([img_feat, txt_feat], dim=1))
         else:
             modal_feat = img_feat if img_feat is not None else txt_feat
-            if modal_feat is not None:
-                for layer in self.semantic_layers:
-                    modal_feat = layer(modal_feat, self.modal_adj)
-        
-        # User-item propagation
-        x = torch.cat([self.user_embedding.weight, self.item_embedding.weight])
-        all_embs = [x]
+            
+        # Graph convolution
+        ego_embeddings = torch.cat([self.user_embedding.weight, self.item_embedding.weight])
+        all_embeddings = [ego_embeddings]
         
         for _ in range(self.n_layers):
-            x = torch.sparse.mm(self.norm_adj, x)
-            all_embs.append(x)
+            ego_embeddings = torch.sparse.mm(self.norm_adj, ego_embeddings)
+            all_embeddings.append(ego_embeddings)
             
-        x = torch.stack(all_embs, dim=1).mean(dim=1)
-        user_emb, item_emb = torch.split(x, [self.n_users, self.n_items])
+        all_embeddings = torch.stack(all_embeddings, dim=1)
+        all_embeddings = all_embeddings.mean(dim=1)
         
-        # Combine with modal features
+        user_emb, item_emb = torch.split(all_embeddings, [self.n_users, self.n_items])
+        
         if modal_feat is not None:
             item_emb = item_emb + modal_feat
             
@@ -234,33 +202,32 @@ class MMGAT(GeneralRecommender):
         pos_e = item_emb[pos_items]
         neg_e = item_emb[neg_items]
         
-        # Hierarchical recommendation loss
+        # BPR loss
         pos_scores = torch.sum(u_e * pos_e, dim=1)
         neg_scores = torch.sum(u_e * neg_e, dim=1)
-        rec_loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
+        bpr_loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
         
-        # Semantic contrastive loss
-        sem_loss = 0.0
+        # Contrastive loss
+        modal_loss = 0.0
         if img_feat is not None and txt_feat is not None:
-            i_feat = F.normalize(img_feat[pos_items])
-            t_feat = F.normalize(txt_feat[pos_items])
-            i_pred = F.normalize(img_pred[pos_items])
-            t_pred = F.normalize(txt_pred[pos_items])
+            img_pos = F.normalize(img_feat[pos_items])
+            txt_pos = F.normalize(txt_feat[pos_items])
+            img_p = F.normalize(img_pred[pos_items])
+            txt_p = F.normalize(txt_pred[pos_items])
             
-            # Bidirectional semantic alignment
-            sem_loss = -(
-                torch.mean(F.cosine_similarity(i_feat, t_pred.detach())) +
-                torch.mean(F.cosine_similarity(t_feat, i_pred.detach()))
+            modal_loss = -(
+                torch.mean(F.cosine_similarity(img_pos, txt_p.detach())) +
+                torch.mean(F.cosine_similarity(txt_pos, img_p.detach()))
             ) / 2
-        
-        # Regularization
+            
+        # L2 regularization
         reg_loss = self.reg_weight * (
             torch.norm(u_e) +
             torch.norm(pos_e) +
             torch.norm(neg_e)
         )
         
-        return rec_loss + 0.2 * sem_loss + reg_loss
+        return bpr_loss + 0.1 * modal_loss + reg_loss
 
     def full_sort_predict(self, interaction):
         user = interaction[0]
