@@ -23,15 +23,18 @@ class ModalEncoder(nn.Module):
     def forward(self, x):
         return F.normalize(self.encoder(x), p=2, dim=1)
 
-class GraphAttentionLayer(nn.Module):
-    def __init__(self, dim, dropout=0.2):
+class CrossModalAttention(nn.Module):
+    def __init__(self, dim, dropout=0.1):
         super().__init__()
-        self.gat = GATConv(dim, dim // 4, heads=4, dropout=dropout)
+        self.attention = nn.MultiheadAttention(dim, num_heads=4, dropout=dropout, batch_first=True)
         self.norm = nn.LayerNorm(dim)
         self.dropout = nn.Dropout(dropout)
         
-    def forward(self, x, edge_index):
-        return self.norm(x + self.dropout(self.gat(x, edge_index)))
+    def forward(self, x1, x2):
+        h1, _ = self.attention(x1.unsqueeze(1), x2.unsqueeze(1), x2.unsqueeze(1))
+        h2, _ = self.attention(x2.unsqueeze(1), x1.unsqueeze(1), x1.unsqueeze(1))
+        h = torch.cat([h1.squeeze(1), h2.squeeze(1)], dim=1)
+        return self.norm(h + self.dropout(h))
 
 class MMGAT(GeneralRecommender):
     def __init__(self, config, dataset):
@@ -60,14 +63,12 @@ class MMGAT(GeneralRecommender):
             self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
             self.text_encoder = ModalEncoder(self.t_feat.shape[1], self.hidden_dim, self.feat_embed_dim, self.dropout)
             
-        # Graph layers
-        self.mm_layers = nn.ModuleList([
-            GraphAttentionLayer(self.feat_embed_dim, self.dropout)
-            for _ in range(self.n_layers)
-        ])
+        # Cross-modal attention
+        self.cross_modal_attention = CrossModalAttention(self.feat_embed_dim, self.dropout)
         
+        # Graph layers
         self.ui_layers = nn.ModuleList([
-            GraphAttentionLayer(self.embedding_dim, self.dropout)
+            GATConv(self.embedding_dim, self.embedding_dim // 4, heads=4, dropout=self.dropout)
             for _ in range(self.n_layers)
         ])
         
@@ -125,45 +126,35 @@ class MMGAT(GeneralRecommender):
         
         if self.v_feat is not None:
             img_emb = self.image_encoder(self.image_embedding.weight)
-            for layer in self.mm_layers:
-                img_emb = layer(img_emb, self.mm_edge_index)
-                
+            
         if self.t_feat is not None:
             txt_emb = self.text_encoder(self.text_embedding.weight)
-            for layer in self.mm_layers:
-                txt_emb = layer(txt_emb, self.mm_edge_index)
-        
-        # Fuse modalities
+            
+        # Cross-modal attention
         if img_emb is not None and txt_emb is not None:
-            modal_emb = self.fusion(torch.cat([img_emb, txt_emb], dim=1))
+            modal_emb = self.cross_modal_attention(img_emb, txt_emb)
         else:
             modal_emb = img_emb if img_emb is not None else txt_emb
         
         # Process user-item graph
         x = torch.cat([self.user_embedding.weight, self.item_embedding.weight])
-        all_embs = [x]
-        
         for layer in self.ui_layers:
-            if self.training:
-                x = F.dropout(x, p=self.dropout)
             x = layer(x, self.edge_index)
-            all_embs.append(x)
             
-        x = torch.stack(all_embs, dim=1).mean(dim=1)
         user_emb, item_emb = torch.split(x, [self.n_users, self.n_items])
         
         # Combine with modal embeddings
         if modal_emb is not None:
             item_emb = item_emb + modal_emb
             
-        return user_emb, item_emb, img_emb, txt_emb
+        return user_emb, item_emb
 
     def calculate_loss(self, interaction):
         users = interaction[0]
         pos_items = interaction[1]
         neg_items = interaction[2]
         
-        user_emb, item_emb, img_emb, txt_emb = self.forward()
+        user_emb, item_emb = self.forward()
         
         u_emb = user_emb[users]
         pos_emb = item_emb[pos_items]
@@ -174,13 +165,6 @@ class MMGAT(GeneralRecommender):
         neg_scores = torch.sum(u_emb * neg_emb, dim=1)
         mf_loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
         
-        # Modal contrastive loss
-        modal_loss = 0.0
-        if img_emb is not None and txt_emb is not None:
-            pos_sim = F.cosine_similarity(img_emb[pos_items], txt_emb[pos_items])
-            neg_sim = F.cosine_similarity(img_emb[pos_items], txt_emb[neg_items])
-            modal_loss = -torch.mean(F.logsigmoid(pos_sim - neg_sim))
-        
         # Regularization loss
         reg_loss = self.reg_weight * (
             torch.norm(u_emb) +
@@ -188,10 +172,10 @@ class MMGAT(GeneralRecommender):
             torch.norm(neg_emb)
         )
         
-        return mf_loss + 0.1 * modal_loss + reg_loss
+        return mf_loss + reg_loss
 
     def full_sort_predict(self, interaction):
         user = interaction[0]
-        user_emb, item_emb, _, _ = self.forward()
+        user_emb, item_emb = self.forward()
         scores = torch.matmul(user_emb[user], item_emb.transpose(0, 1))
         return scores
