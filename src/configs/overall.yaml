@@ -42,7 +42,7 @@ field_separator: "\t"
 metrics: ["Recall", "NDCG", "Precision", "MAP"]
 topk: [5, 10, 20, 50]
 valid_metric: Recall@5
-eval_batch_size: 4096
+eval_batch_size: 2048
 
 #
 use_raw_features: False
