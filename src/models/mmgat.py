@@ -251,5 +251,5 @@ class MMGAT(GeneralRecommender):
         user_emb, item_emb, _, _ = self.forward()
         
         scores = torch.matmul(user_emb[user], item_emb.transpose(0, 1))
-        scores = scores + self.user_bias(user).squeeze() + self.item_bias.weight.squeeze()
+        #scores = scores + self.user_bias(user).squeeze() + self.item_bias.weight.squeeze()
         return scores
