@@ -65,27 +65,33 @@ class MMGAT(GeneralRecommender):
             nn.Linear(self.embedding_dim, self.embedding_dim)
         )
 
-    def encode_modalities(self, users):
+    def encode_modalities(self, items):
+        """
+        Encode and fuse modal features for given items
+        Args:
+            items: Item indices tensor of shape (batch_size,)
+        Returns:
+            Tuple of (fused_embeddings, list of modal_embeddings)
+        """
         modal_embeddings = []
+        batch_size = items.size(0)
         
         # Encode visual features if available
         if self.v_feat is not None:
-            visual_emb = self.image_encoder(self.image_embedding.weight)
+            visual_emb = self.image_encoder(self.image_embedding.weight[items])
             modal_embeddings.append(visual_emb)
             
         # Encode textual features if available
         if self.t_feat is not None:
-            text_emb = self.text_encoder(self.text_embedding.weight)
+            text_emb = self.text_encoder(self.text_embedding.weight[items])
             modal_embeddings.append(text_emb)
             
         # Dynamic fusion of modalities
         if len(modal_embeddings) > 1:
-            # Get user preferences for modalities
-            user_prefs = F.softmax(self.user_modal_preference[users], dim=-1)
             fused_emb = self.modal_attention(
                 modal_embeddings[0],
                 modal_embeddings[1],
-                user_prefs
+                batch_size
             )
         else:
             fused_emb = modal_embeddings[0]
@@ -93,51 +99,23 @@ class MMGAT(GeneralRecommender):
         return fused_emb, modal_embeddings
 
     def forward(self, users, items):
+        """
+        Forward pass of the model
+        Args:
+            users: User indices tensor of shape (batch_size,)
+            items: Item indices tensor of shape (batch_size,)
+        """
         # Get base embeddings
         user_emb = self.user_embedding(users)
         item_emb = self.item_id_embedding(items)
         
-        # Encode and fuse modalities
-        fused_modal_emb, modal_embs = self.encode_modalities(users)
+        # Encode and fuse modalities for items
+        fused_modal_emb, modal_embs = self.encode_modalities(items)
         
-        # Apply graph attention layers
-        x = torch.cat([user_emb, item_emb], dim=0)
-        for gat_layer in self.gat_layers:
-            x = gat_layer(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
+        # Combine item embeddings with modal information
+        item_emb = item_emb + fused_modal_emb
         
-        # Split back user and item embeddings
-        user_final_emb, item_final_emb = torch.split(x, [user_emb.size(0), item_emb.size(0)])
-        
-        # Combine with modal information
-        item_final_emb = item_final_emb + fused_modal_emb
-        
-        return user_final_emb, item_final_emb, modal_embs
-
-    def calc_loss(self, user_emb, item_emb, modal_embs):
-        # Basic recommendation loss
-        pred_ratings = torch.sum(user_emb * item_emb, dim=1)
-        rec_loss = F.binary_cross_entropy_with_logits(pred_ratings, labels)
-        
-        # Contrastive loss for modalities
-        if len(modal_embs) > 1:
-            proj_modal1 = self.projector(modal_embs[0])
-            proj_modal2 = self.projector(modal_embs[1])
-            
-            sim_matrix = torch.mm(proj_modal1, proj_modal2.t()) / self.temp
-            labels = torch.arange(sim_matrix.size(0)).to(self.device)
-            contra_loss = F.cross_entropy(sim_matrix, labels)
-        else:
-            contra_loss = 0
-            
-        # Regularization
-        reg_loss = self.reg_weight * (
-            torch.norm(user_emb) +
-            torch.norm(item_emb) +
-            torch.norm(self.user_modal_preference)
-        )
-        
-        return rec_loss + contra_loss + reg_loss
+        return user_emb, item_emb, modal_embs
 
     def calculate_loss(self, interaction):
         users = interaction[0]
@@ -147,22 +125,40 @@ class MMGAT(GeneralRecommender):
         user_emb, pos_emb, modal_embs = self.forward(users, pos_items)
         _, neg_emb, _ = self.forward(users, neg_items)
         
+        # BPR loss
         pos_scores = torch.sum(user_emb * pos_emb, dim=1)
         neg_scores = torch.sum(user_emb * neg_emb, dim=1)
+        bpr_loss = -torch.mean(torch.log(torch.sigmoid(pos_scores - neg_scores)))
         
-        loss = self.calc_loss(user_emb, pos_emb, modal_embs)
-        loss += -torch.mean(torch.log(torch.sigmoid(pos_scores - neg_scores)))
+        # Contrastive loss for modalities if multiple modalities exist
+        contra_loss = 0
+        if len(modal_embs) > 1:
+            proj_modal1 = self.projector(modal_embs[0])
+            proj_modal2 = self.projector(modal_embs[1])
+            
+            sim = torch.matmul(proj_modal1, proj_modal2.transpose(0, 1)) / self.temp
+            labels = torch.arange(sim.size(0)).to(self.device)
+            contra_loss = F.cross_entropy(sim, labels)
         
-        return loss
+        # Regularization
+        reg_loss = self.reg_weight * (
+            torch.norm(user_emb) +
+            torch.norm(pos_emb) +
+            torch.norm(neg_emb)
+        )
+        
+        return bpr_loss + contra_loss + reg_loss
 
     def full_sort_predict(self, interaction):
         user = interaction[0]
         user_emb = self.user_embedding(user)
         
+        # Get embeddings for all items
         all_items = torch.arange(self.n_items).to(self.device)
         item_emb = self.item_id_embedding(all_items)
         
-        fused_modal_emb, _ = self.encode_modalities(user)
+        # Get modal embeddings for all items
+        fused_modal_emb, _ = self.encode_modalities(all_items)
         item_emb = item_emb + fused_modal_emb
         
         scores = torch.matmul(user_emb, item_emb.t())
@@ -177,18 +173,9 @@ class ModalEncoder(nn.Module):
             nn.ReLU(),
             nn.Linear(output_dim * 2, output_dim)
         )
-        self.attention = nn.MultiheadAttention(output_dim, n_heads)
         
     def forward(self, x):
-        # Transform features
-        h = self.transform(x)
-        
-        # Self-attention
-        h = h.unsqueeze(0)  # Add sequence dimension
-        h, _ = self.attention(h, h, h)
-        h = h.squeeze(0)  # Remove sequence dimension
-        
-        return h
+        return self.transform(x)
 
 class ModalAttention(nn.Module):
     def __init__(self, embed_dim, n_heads):
@@ -200,21 +187,27 @@ class ModalAttention(nn.Module):
             nn.ReLU()
         )
         
-    def forward(self, modal1, modal2, user_prefs):
-        # Cross-modal attention
-        modal1 = modal1.unsqueeze(0)
-        modal2 = modal2.unsqueeze(0)
+    def forward(self, modal1, modal2, batch_size):
+        """
+        Args:
+            modal1: First modality tensor of shape (batch_size, embed_dim)
+            modal2: Second modality tensor of shape (batch_size, embed_dim)
+            batch_size: Size of the batch
+        """
+        # Reshape for attention
+        modal1 = modal1.unsqueeze(0)  # (1, batch_size, embed_dim)
+        modal2 = modal2.unsqueeze(0)  # (1, batch_size, embed_dim)
         
+        # Cross-modal attention
         attn_1_2, _ = self.attention(modal1, modal2, modal2)
         attn_2_1, _ = self.attention(modal2, modal1, modal1)
         
         # Remove sequence dimension
-        attn_1_2 = attn_1_2.squeeze(0)
-        attn_2_1 = attn_2_1.squeeze(0)
+        attn_1_2 = attn_1_2.squeeze(0)  # (batch_size, embed_dim)
+        attn_2_1 = attn_2_1.squeeze(0)  # (batch_size, embed_dim)
         
-        # Weighted combination based on user preferences
-        combined = torch.stack([attn_1_2, attn_2_1], dim=1)
-        user_prefs = user_prefs.unsqueeze(-1)
-        fused = torch.sum(combined * user_prefs, dim=1)
+        # Concatenate and fuse
+        concat_features = torch.cat([attn_1_2, attn_2_1], dim=-1)
+        fused = self.fusion(concat_features)
         
-        return self.fusion(fused)
+        return fused
