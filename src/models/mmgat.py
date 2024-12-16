@@ -15,7 +15,7 @@ class MMGAT(GeneralRecommender):
         self.num_heads = config['n_heads']
         self.dropout = config['dropout']
         self.n_layers = config['n_layers']
-        self.num_gat_heads = config['num_gat_heads']
+        self.num_gat_heads = 4
         self.temperature = config['temperature']
         self.reg_weight = config['reg_weight']
         
