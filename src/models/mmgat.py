@@ -12,7 +12,7 @@ class MMGAT(GeneralRecommender):
         # Configuration
         self.embedding_dim = config['embedding_size']
         self.feat_embed_dim = config['feat_embed_dim']
-        self.num_heads = config['num_heads']
+        self.num_heads = config['n_heads']
         self.dropout = config['dropout']
         self.n_layers = config['n_layers']
         self.num_gat_heads = config['num_gat_heads']
