@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from flash_attn import flash_attn_qkvpacked_func, flash_attn_func
 from torch_geometric.nn import GATConv
 from common.abstract_recommender import GeneralRecommender
 
@@ -9,13 +8,11 @@ class MMGAT(GeneralRecommender):
     def __init__(self, config, dataset):
         super(MMGAT, self).__init__(config, dataset)
         
-        # Configuration
         self.embedding_dim = config['embedding_size']
         self.feat_embed_dim = config['feat_embed_dim']
         self.num_heads = config['n_heads']
         self.dropout = config['dropout']
         self.n_layers = config['n_layers']
-        self.num_gat_heads = 4
         self.temperature = config['temperature']
         self.reg_weight = config['reg_weight']
         
@@ -25,7 +22,7 @@ class MMGAT(GeneralRecommender):
         
         # Modal-specific components
         if self.v_feat is not None:
-            self.visual_encoder = ModalFlashEncoder(
+            self.visual_encoder = ModalEncoder(
                 input_dim=self.v_feat.shape[1],
                 hidden_dim=self.feat_embed_dim,
                 num_heads=self.num_heads
@@ -33,26 +30,24 @@ class MMGAT(GeneralRecommender):
             self.visual_proj = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
             
         if self.t_feat is not None:
-            self.text_encoder = ModalFlashEncoder(
+            self.text_encoder = ModalEncoder(
                 input_dim=self.t_feat.shape[1],
                 hidden_dim=self.feat_embed_dim,
                 num_heads=self.num_heads
             )
             self.text_proj = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
-
+            
         # Cross-modal fusion
         self.modal_fusion = CrossModalFusion(
             dim=self.feat_embed_dim,
-            num_heads=self.num_heads
+            num_heads=self.num_heads,
+            dropout=self.dropout
         )
         
         # Graph attention layers
         self.gat_layers = nn.ModuleList([
-            GraphAttentionLayer(
-                in_dim=self.embedding_dim,
-                out_dim=self.embedding_dim,
-                num_heads=self.num_gat_heads
-            ) for _ in range(self.n_layers)
+            GATConv(self.embedding_dim, self.embedding_dim, heads=self.num_heads, dropout=self.dropout)
+            for _ in range(self.n_layers)
         ])
         
         # Feature transformation
@@ -66,7 +61,6 @@ class MMGAT(GeneralRecommender):
         self.init_weights()
 
     def init_weights(self):
-        """Initialize weights using Xavier initialization"""
         for module in self.modules():
             if isinstance(module, (nn.Linear, nn.Embedding)):
                 nn.init.xavier_uniform_(module.weight)
@@ -74,7 +68,6 @@ class MMGAT(GeneralRecommender):
                     nn.init.zeros_(module.bias)
 
     def encode_modalities(self, items):
-        """Encode items using both visual and textual modalities"""
         modal_embeddings = []
         
         if self.v_feat is not None:
@@ -88,7 +81,6 @@ class MMGAT(GeneralRecommender):
             modal_embeddings.append(text_emb)
             
         if len(modal_embeddings) > 1:
-            # Fuse modalities using cross-attention
             fused_embedding = self.modal_fusion(modal_embeddings[0], modal_embeddings[1])
         else:
             fused_embedding = modal_embeddings[0]
@@ -96,146 +88,71 @@ class MMGAT(GeneralRecommender):
         return fused_embedding, modal_embeddings
 
     def forward(self, users, items):
-        """
-        Forward pass of the model
-        Args:
-            users: User indices
-            items: Item indices
-        """
         user_emb = self.user_embedding(users)
         item_emb = self.item_embedding(items)
         
         # Get modal embeddings
         modal_emb, modal_features = self.encode_modalities(items)
         
-        # Combine base embeddings with modal information
+        # Combine item embeddings with modal information
         item_emb = self.feature_fusion(torch.cat([item_emb, modal_emb], dim=-1))
         
-        # Apply graph attention for message passing
+        # Apply graph attention
         combined_emb = torch.cat([user_emb, item_emb], dim=0)
         for gat_layer in self.gat_layers:
             combined_emb = gat_layer(combined_emb)
+            combined_emb = F.relu(combined_emb)
+            combined_emb = F.dropout(combined_emb, p=self.dropout, training=self.training)
         
-        # Split back user and item embeddings
         user_final, item_final = torch.split(combined_emb, [user_emb.size(0), item_emb.size(0)])
         
         return user_final, item_final, modal_features
 
-    def calculate_loss(self, interaction):
-        users = interaction[0]
-        pos_items = interaction[1]
-        neg_items = interaction[2]
-        
-        # Get embeddings for positive and negative interactions
-        user_emb, pos_emb, modal_features = self.forward(users, pos_items)
-        _, neg_emb, _ = self.forward(users, neg_items)
-        
-        # BPR loss
-        pos_scores = torch.sum(user_emb * pos_emb, dim=-1)
-        neg_scores = torch.sum(user_emb * neg_emb, dim=-1)
-        bpr_loss = -torch.mean(torch.log(torch.sigmoid(pos_scores - neg_scores)))
-        
-        # Contrastive loss between modalities
-        contra_loss = 0.0
-        if len(modal_features) > 1:
-            sim_matrix = torch.matmul(modal_features[0], modal_features[1].t())
-            sim_matrix = sim_matrix / self.temperature
-            labels = torch.arange(sim_matrix.size(0)).to(self.device)
-            contra_loss = F.cross_entropy(sim_matrix, labels)
-        
-        # L2 regularization
-        reg_loss = self.reg_weight * (
-            torch.norm(user_emb) + torch.norm(pos_emb) + torch.norm(neg_emb)
-        )
-        
-        return bpr_loss + 0.1 * contra_loss + reg_loss
-
-    def predict(self, interaction):
-        user = interaction[0]
-        item = interaction[1]
-        
-        user_emb, item_emb, _ = self.forward(user, item)
-        scores = torch.sum(user_emb * item_emb, dim=1)
-        return scores
-
-    def full_sort_predict(self, interaction):
-        user = interaction[0]
-        user_emb = self.user_embedding(user)
-        
-        # Calculate scores for all items
-        all_items = torch.arange(self.n_items).to(self.device)
-        all_item_emb = self.item_embedding(all_items)
-        
-        # Get modal embeddings for all items
-        modal_emb, _ = self.encode_modalities(all_items)
-        all_item_emb = self.feature_fusion(torch.cat([all_item_emb, modal_emb], dim=-1))
-        
-        scores = torch.matmul(user_emb, all_item_emb.t())
-        return scores
-
-class ModalFlashEncoder(nn.Module):
+class ModalEncoder(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_heads):
         super().__init__()
         self.input_proj = nn.Linear(input_dim, hidden_dim)
-        self.qkv_proj = nn.Linear(hidden_dim, 3 * hidden_dim)
-        self.num_heads = num_heads
-        self.head_dim = hidden_dim // num_heads
+        self.encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=0.1,
+            batch_first=True
+        )
+        self.encoder = nn.TransformerEncoder(self.encoder_layer, num_layers=1)
         
     def forward(self, x):
-        batch_size = x.shape[0]
-        
-        # Project input features
         x = self.input_proj(x)
-        
-        # Generate QKV matrices
-        qkv = self.qkv_proj(x)
-        qkv = qkv.reshape(batch_size, -1, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, H, S, D)
-        
-        # Apply Flash Attention
-        output = flash_attn_qkvpacked_func(qkv, dropout_p=0.0)
-        output = output.reshape(batch_size, -1, self.num_heads * self.head_dim)
-        
-        return output
+        x = x.unsqueeze(1)  # Add sequence dimension
+        x = self.encoder(x)
+        return x.squeeze(1)  # Remove sequence dimension
 
 class CrossModalFusion(nn.Module):
-    def __init__(self, dim, num_heads):
+    def __init__(self, dim, num_heads, dropout=0.1):
         super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        
-        self.q_proj = nn.Linear(dim, dim)
-        self.k_proj = nn.Linear(dim, dim)
-        self.v_proj = nn.Linear(dim, dim)
-        self.output_proj = nn.Linear(dim, dim)
+        self.attention = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * 4, dim)
+        )
         
     def forward(self, x1, x2):
-        batch_size = x1.shape[0]
+        # Self attention
+        x1 = x1.unsqueeze(1)
+        x2 = x2.unsqueeze(1)
         
-        # Project to Q, K, V
-        q = self.q_proj(x1).reshape(batch_size, -1, self.num_heads, self.head_dim)
-        k = self.k_proj(x2).reshape(batch_size, -1, self.num_heads, self.head_dim)
-        v = self.v_proj(x2).reshape(batch_size, -1, self.num_heads, self.head_dim)
+        # Cross attention
+        attn_output, _ = self.attention(x1, x2, x2)
+        x = x1 + attn_output
+        x = self.norm1(x)
         
-        # Transpose for attention
-        q = q.transpose(1, 2)  # (B, H, S, D)
-        k = k.transpose(1, 2)  # (B, H, S, D)
-        v = v.transpose(1, 2)  # (B, H, S, D)
+        # Feed forward
+        ff_output = self.ffn(x)
+        x = x + ff_output
+        x = self.norm2(x)
         
-        # Apply Flash Attention
-        output = flash_attn_func(q, k, v, dropout_p=0.0)
-        
-        # Reshape and project output
-        output = output.transpose(1, 2).reshape(batch_size, -1, self.dim)
-        output = self.output_proj(output)
-        
-        return output
-
-class GraphAttentionLayer(nn.Module):
-    def __init__(self, in_dim, out_dim, num_heads):
-        super().__init__()
-        self.gat = GATConv(in_dim, out_dim // num_heads, heads=num_heads)
-        
-    def forward(self, x):
-        return self.gat(x)
+        return x.squeeze(1)
