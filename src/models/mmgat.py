@@ -50,6 +50,7 @@ class MMGAT(GeneralRecommender):
         self.norm_adj = self.get_norm_adj_mat().to(self.device)
         self.mm_adj = None
         self.build_item_graph = True
+        self.dataset = dataset
 
     def get_norm_adj_mat(self):
         def normalized_adj_single(adj):
@@ -60,9 +61,12 @@ class MMGAT(GeneralRecommender):
             norm_adj = d_mat_inv.dot(adj)
             return norm_adj.tocoo()
 
+        # Get interaction matrix directly from dataloader's dataset
+        interaction_matrix = self.dataset.inter_matrix(form='coo').astype(np.float32)
+        
         adj_mat = sp.dok_matrix((self.n_users + self.n_items, self.n_users + self.n_items), dtype=np.float32)
         adj_mat = adj_mat.tolil()
-        R = self.dataset.inter_matrix(form='coo').astype(np.float32).tolil()
+        R = interaction_matrix.tolil()
         adj_mat[:self.n_users, self.n_users:] = R
         adj_mat[self.n_users:, :self.n_users] = R.T
         adj_mat = adj_mat.todok()
