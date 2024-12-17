@@ -1,11 +1,8 @@
-# coding: utf-8
-
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-import scipy.sparse as sp
+from torch.nn.functional import cosine_similarity
+import math
 from common.abstract_recommender import GeneralRecommender
 from common.loss import BPRLoss, EmbLoss
 
@@ -14,190 +11,273 @@ class MMGAT(GeneralRecommender):
         super(MMGAT, self).__init__(config, dataset)
         
         # Hyperparameters
-        self.embedding_dim = 64
+        self.embedding_dim = 64  
         self.feat_embed_dim = 64
         self.num_heads = 4
-        self.dropout = 0.3
-        self.n_ui_layers = 2
-        self.n_mm_layers = 2
-        self.reg_weight = 1e-4
+        self.dropout = 0.2
+        self.n_layers = 2
         self.temperature = 0.2
-        self.knn_k = 10
-        self.mirror_grad_weight = 0.2
-        self.device = config['device']
+        self.reg_weight = 1e-4
+        self.beta = 0.5
+        self.mm_fusion_mode = 'gate'
+        self.num_routing = 3
         
-        # Basic initialization
         self.n_nodes = self.n_users + self.n_items
+        
+        # Embeddings
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
         self.item_id_embedding = nn.Embedding(self.n_items, self.embedding_dim)
+        
         nn.init.xavier_uniform_(self.user_embedding.weight)
         nn.init.xavier_uniform_(self.item_id_embedding.weight)
 
-        # Flash attention components
-        self.q_proj = nn.Linear(self.embedding_dim, self.embedding_dim)
-        self.k_proj = nn.Linear(self.embedding_dim, self.embedding_dim)
-        self.v_proj = nn.Linear(self.embedding_dim, self.embedding_dim)
-        
-        # Modality-specific components
+        # Feature transformations
         if self.v_feat is not None:
             self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
-            self.image_transform = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
-            self.image_attn = nn.MultiheadAttention(self.feat_embed_dim, self.num_heads, dropout=self.dropout, batch_first=True)
-        
+            self.image_trs = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
+            self.image_gate = nn.Linear(self.feat_embed_dim * 2, 1)
+            
         if self.t_feat is not None:
             self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
-            self.text_transform = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
-            self.text_attn = nn.MultiheadAttention(self.feat_embed_dim, self.num_heads, dropout=self.dropout, batch_first=True)
+            self.text_trs = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
+            self.text_gate = nn.Linear(self.feat_embed_dim * 2, 1)
 
-        # Initialize adjacency matrices
-        self.norm_adj = self.get_norm_adj_mat().to(self.device)
-        self.mm_adj = self.init_mm_adj()
+        # Flash attention layers
+        self.flash_attn = nn.ModuleList([
+            FlashMultiHeadAttention(self.embedding_dim, self.num_heads, self.dropout)
+            for _ in range(self.n_layers)
+        ])
         
-        # Projection layers
-        self.modal_fusion = nn.Linear(self.feat_embed_dim * 2, self.embedding_dim)
-        self.predictor = nn.Sequential(
-            nn.Linear(self.embedding_dim, self.embedding_dim),
-            nn.LeakyReLU(),
-            nn.Linear(self.embedding_dim, self.embedding_dim)
+        # Graph attention layers
+        self.graph_attn = nn.ModuleList([
+            GraphAttentionLayer(self.embedding_dim, self.dropout)
+            for _ in range(self.n_layers)
+        ])
+        
+        # Capsule network for routing
+        self.routing_weights = nn.Parameter(torch.randn(self.num_routing, self.feat_embed_dim, self.feat_embed_dim))
+        
+        # Layer normalization
+        self.layer_norm1 = nn.LayerNorm(self.embedding_dim)
+        self.layer_norm2 = nn.LayerNorm(self.feat_embed_dim)
+        
+        # MLP for fusion
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(self.feat_embed_dim * 2, self.feat_embed_dim),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.feat_embed_dim, self.feat_embed_dim)
         )
-
-        self.inter_mat = dataset.inter_matrix(form='coo').astype(np.float32)
-
-    def init_mm_adj(self):
-        mm_adj = None
-        if self.v_feat is not None:
-            v_adj = self.build_knn_graph(self.image_embedding.weight)
-            mm_adj = v_adj
         
-        if self.t_feat is not None:
-            t_adj = self.build_knn_graph(self.text_embedding.weight)
-            if mm_adj is None:
-                mm_adj = t_adj
+    def routing_mechanism(self, features):
+        b = torch.zeros(features.size(0), self.num_routing, device=features.device)
+        
+        for i in range(self.num_routing):
+            c = F.softmax(b, dim=1)
+            c = c.unsqueeze(2)
+            
+            weighted_pred = torch.matmul(features.unsqueeze(1), self.routing_weights)
+            weighted_sum = (c * weighted_pred).sum(dim=1)
+            
+            if i < self.num_routing - 1:
+                b = b + (weighted_pred * features.unsqueeze(1)).sum(dim=-1)
+                
+        return weighted_sum
+
+    def multimodal_fusion(self, visual_feat, text_feat):
+        if self.mm_fusion_mode == 'gate':
+            if visual_feat is not None and text_feat is not None:
+                # Gating mechanism
+                visual_gate = torch.sigmoid(self.image_gate(torch.cat([visual_feat, text_feat], dim=-1)))
+                text_gate = torch.sigmoid(self.text_gate(torch.cat([text_feat, visual_feat], dim=-1)))
+                
+                # Normalized fusion
+                fused_feat = visual_gate * visual_feat + text_gate * text_feat
+                fused_feat = self.layer_norm2(fused_feat)
+            elif visual_feat is not None:
+                fused_feat = visual_feat
             else:
-                mm_adj = 0.5 * (mm_adj + t_adj)
-        
-        return mm_adj.to(self.device) if mm_adj is not None else None
+                fused_feat = text_feat
+                
+            return self.fusion_mlp(torch.cat([fused_feat, fused_feat], dim=-1))
+        else:
+            if visual_feat is not None and text_feat is not None:
+                return (visual_feat + text_feat) / 2
+            elif visual_feat is not None:
+                return visual_feat
+            else:
+                return text_feat
 
-    def build_knn_graph(self, embeddings):
-        sim = F.normalize(embeddings, p=2, dim=1) @ F.normalize(embeddings, p=2, dim=1).t()
-        topk_values, topk_indices = torch.topk(sim, k=self.knn_k, dim=1)
-        mask = torch.zeros_like(sim).scatter_(1, topk_indices, 1.0)
-        adj = mask * sim
-        
-        # Symmetric normalization
-        degree = torch.sum(adj, dim=1)
-        degree_inv_sqrt = torch.pow(degree + 1e-7, -0.5)
-        degree_matrix_inv_sqrt = torch.diag(degree_inv_sqrt)
-        norm_adj = degree_matrix_inv_sqrt @ adj @ degree_matrix_inv_sqrt
-        
-        return norm_adj
-
-    def get_norm_adj_mat(self):
-        adj_mat = sp.dok_matrix((self.n_nodes, self.n_nodes), dtype=np.float32)
-        
-        adj_mat[:self.n_users, self.n_users:] = self.inter_mat
-        adj_mat[self.n_users:, :self.n_users] = self.inter_mat.T
-        
-        rowsum = np.array(adj_mat.sum(axis=1))
-        d_inv = np.power(rowsum + 1e-7, -0.5).flatten()
-        d_mat = sp.diags(d_inv)
-        norm_adj = d_mat.dot(adj_mat).dot(d_mat)
-        
-        return self._convert_sp_mat_to_tensor(norm_adj)
-
-    def _convert_sp_mat_to_tensor(self, matrix):
-        matrix = matrix.tocoo()
-        indices = torch.LongTensor([matrix.row, matrix.col])
-        values = torch.FloatTensor(matrix.data)
-        shape = torch.Size(matrix.shape)
-        return torch.sparse.FloatTensor(indices, values, shape)
-
-    def flash_attention(self, query, key, value):
-        # Scaled dot-product attention with flash attention optimization
-        attn_weights = (query @ key.transpose(-2, -1)) / np.sqrt(query.size(-1))
-        attn_weights = F.softmax(attn_weights, dim=-1)
-        attn_weights = F.dropout(attn_weights, p=self.dropout, training=self.training)
-        return attn_weights @ value
-
-    def forward(self):
+    def forward(self, adj_matrix=None):
         # Process multimodal features
-        modal_emb = None
+        visual_feat = None
+        text_feat = None
+        
         if self.v_feat is not None:
-            img_emb = self.image_transform(self.image_embedding.weight)
-            img_emb, _ = self.image_attn(img_emb, img_emb, img_emb)
-            modal_emb = img_emb
-        
+            visual_feat = self.image_trs(self.image_embedding.weight)
+            visual_feat = self.routing_mechanism(visual_feat)
+            
         if self.t_feat is not None:
-            txt_emb = self.text_transform(self.text_embedding.weight)
-            txt_emb, _ = self.text_attn(txt_emb, txt_emb, txt_emb)
-            modal_emb = txt_emb if modal_emb is None else torch.cat([modal_emb, txt_emb], dim=-1)
-
-        if modal_emb is not None:
-            modal_emb = self.modal_fusion(modal_emb)
-            
-        # Graph convolution on user-item graph
-        ego_embeddings = torch.cat([self.user_embedding.weight, self.item_id_embedding.weight], dim=0)
-        all_embeddings = [ego_embeddings]
+            text_feat = self.text_trs(self.text_embedding.weight)
+            text_feat = self.routing_mechanism(text_feat)
         
-        for _ in range(self.n_ui_layers):
-            ego_embeddings = torch.sparse.mm(self.norm_adj, ego_embeddings)
-            all_embeddings.append(ego_embeddings)
-            
-        all_embeddings = torch.stack(all_embeddings, dim=1)
-        all_embeddings = torch.mean(all_embeddings, dim=1)
+        # Fuse multimodal features
+        mm_feat = self.multimodal_fusion(visual_feat, text_feat)
         
-        u_g_embeddings, i_g_embeddings = torch.split(all_embeddings, [self.n_users, self.n_items])
+        # Process user-item graph
+        user_embed = self.user_embedding.weight
+        item_embed = self.item_id_embedding.weight
         
-        # Combine with modal embeddings if available
-        if modal_emb is not None:
-            i_g_embeddings = i_g_embeddings + modal_emb
+        all_embed = torch.cat([user_embed, item_embed], dim=0)
+        all_embed = self.layer_norm1(all_embed)
+        
+        # Apply flash attention and graph attention
+        for flash_layer, graph_layer in zip(self.flash_attn, self.graph_attn):
+            all_embed = flash_layer(all_embed, all_embed, all_embed)
+            if adj_matrix is not None:
+                all_embed = graph_layer(all_embed, adj_matrix)
             
-        return u_g_embeddings, i_g_embeddings
-
+        user_embed, item_embed = torch.split(all_embed, [self.n_users, self.n_items])
+        
+        # Combine with multimodal features
+        if mm_feat is not None:
+            item_embed = item_embed + mm_feat
+            
+        return user_embed, item_embed
+        
     def calculate_loss(self, interaction):
         users = interaction[0]
         pos_items = interaction[1]
         neg_items = interaction[2]
-
+        
+        user_embeddings, item_embeddings = self.forward()
+        
+        # Mirror gradient
+        with torch.no_grad():
+            user_embeddings_mirror = user_embeddings.clone()
+            item_embeddings_mirror = item_embeddings.clone()
+        
+        user_e = user_embeddings[users]
+        pos_e = item_embeddings[pos_items]
+        neg_e = item_embeddings[neg_items]
+        
         # First forward pass
-        u_embeddings, i_embeddings = self.forward()
-        
-        user_e = u_embeddings[users]
-        pos_e = i_embeddings[pos_items]
-        neg_e = i_embeddings[neg_items]
-        
-        # BPR loss
         pos_scores = torch.sum(user_e * pos_e, dim=1)
         neg_scores = torch.sum(user_e * neg_e, dim=1)
-        bpr_loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
-
-        # Contrastive loss
-        pos_scores_norm = F.normalize(pos_scores.unsqueeze(-1), dim=1)
-        neg_scores_norm = F.normalize(neg_scores.unsqueeze(-1), dim=1)
-        contrastive_loss = -torch.log(
-            torch.exp(pos_scores_norm/self.temperature) / 
-            (torch.exp(pos_scores_norm/self.temperature) + torch.exp(neg_scores_norm/self.temperature))
-        ).mean()
-
-        # Mirror gradient regularization
-        mirror_reg = torch.mean(torch.abs(user_e.grad if user_e.grad is not None else 0))
         
+        main_loss = -torch.mean(torch.log(torch.sigmoid(pos_scores - neg_scores)))
+        
+        # Mirror gradient second pass
+        user_e_mirror = user_embeddings_mirror[users]
+        pos_e_mirror = item_embeddings_mirror[pos_items]
+        neg_e_mirror = item_embeddings_mirror[neg_items]
+        
+        pos_scores_mirror = torch.sum(user_e_mirror * pos_e_mirror, dim=1)
+        neg_scores_mirror = torch.sum(user_e_mirror * neg_e_mirror, dim=1)
+        
+        mirror_loss = -torch.mean(torch.log(torch.sigmoid(pos_scores_mirror - neg_scores_mirror)))
+        
+        # Contrastive loss for multimodal features
+        if self.v_feat is not None:
+            v_feat = self.image_trs(self.image_embedding.weight[pos_items])
+            v_loss = 1 - cosine_similarity(v_feat, pos_e, dim=-1).mean()
+        else:
+            v_loss = 0.0
+            
+        if self.t_feat is not None:
+            t_feat = self.text_trs(self.text_embedding.weight[pos_items])
+            t_loss = 1 - cosine_similarity(t_feat, pos_e, dim=-1).mean()
+        else:
+            t_loss = 0.0
+            
         # L2 regularization
-        l2_loss = self.reg_weight * (
+        reg_loss = self.reg_weight * (
             torch.norm(user_e) +
             torch.norm(pos_e) +
             torch.norm(neg_e)
         )
-
-        loss = bpr_loss + 0.1 * contrastive_loss + self.mirror_grad_weight * mirror_reg + l2_loss
         
-        return loss
+        return main_loss + self.beta * mirror_loss + reg_loss + v_loss + t_loss
 
     def full_sort_predict(self, interaction):
         user = interaction[0]
         
-        user_e, item_e = self.forward()
-        user_e = user_e[user]
+        user_embeddings, item_embeddings = self.forward()
         
-        scores = torch.matmul(user_e, item_e.transpose(0, 1))
+        user_e = user_embeddings[user]
+        scores = torch.matmul(user_e, item_embeddings.transpose(0, 1))
+        
         return scores
+
+class FlashMultiHeadAttention(nn.Module):
+    def __init__(self, d_model, num_heads, dropout):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.dropout = dropout
+        
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.o_proj = nn.Linear(d_model, d_model)
+        
+        self.scale = math.sqrt(self.head_dim)
+        
+    def forward(self, q, k, v, mask=None):
+        batch_size = q.size(0)
+        
+        # Project and reshape
+        q = self.q_proj(q).view(batch_size, -1, self.num_heads, self.head_dim)
+        k = self.k_proj(k).view(batch_size, -1, self.num_heads, self.head_dim)
+        v = self.v_proj(v).view(batch_size, -1, self.num_heads, self.head_dim)
+        
+        # Transpose for attention computation
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        # Compute attention
+        attn = torch.matmul(q, k.transpose(-2, -1)) / self.scale
+        
+        if mask is not None:
+            attn = attn.masked_fill(mask == 0, float('-inf'))
+            
+        attn = F.softmax(attn, dim=-1)
+        attn = F.dropout(attn, p=self.dropout, training=self.training)
+        
+        # Compute output
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).contiguous()
+        out = out.view(batch_size, -1, self.d_model)
+        
+        return self.o_proj(out)
+
+class GraphAttentionLayer(nn.Module):
+    def __init__(self, input_dim, dropout):
+        super().__init__()
+        self.dropout = dropout
+        
+        # Edge attention parameters
+        self.a = nn.Parameter(torch.empty(size=(2*input_dim, 1)))
+        nn.init.xavier_uniform_(self.a.data)
+        
+        self.leakyrelu = nn.LeakyReLU()
+        
+    def forward(self, h, adj):
+        N = h.size()[0]
+        
+        # Compute attention coefficients
+        a_input = torch.cat([h.repeat(1, N).view(N * N, -1), h.repeat(N, 1)], dim=1).view(N, N, -1)
+        e = self.leakyrelu(torch.matmul(a_input, self.a).squeeze(2))
+        
+        # Mask attention coefficients
+        zero_vec = -9e15*torch.ones_like(e)
+        attention = torch.where(adj > 0, e, zero_vec)
+        attention = F.softmax(attention, dim=1)
+        attention = F.dropout(attention, self.dropout, training=self.training)
+        
+        # Apply attention
+        h_prime = torch.matmul(attention, h)
+        
+        return h_prime
