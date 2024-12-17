@@ -104,14 +104,16 @@ class MMGAT(GeneralRecommender):
         D = sp.diags(diag)
         L = D * A * D
         
-        # Convert to tensor
         L = sp.coo_matrix(L)
-        indices = torch.LongTensor([L.row, L.col])
-        values = torch.FloatTensor(L.data)
-        return torch.sparse.FloatTensor(indices, values, torch.Size([self.n_nodes, self.n_nodes]))
+        indices = torch.LongTensor([L.row, L.col]).to(self.device)
+        values = torch.FloatTensor(L.data).to(self.device)
+        return torch.sparse_coo_tensor(indices, values, torch.Size([self.n_nodes, self.n_nodes]), device=self.device)
 
     def get_knn_adj_mat(self, embeddings):
         """Create kNN adjacency matrix from embeddings"""
+        # Ensure embeddings are on the correct device
+        embeddings = embeddings.to(self.device)
+        
         # Normalize embeddings
         norm_embeddings = F.normalize(embeddings, p=2, dim=1)
         
@@ -121,14 +123,16 @@ class MMGAT(GeneralRecommender):
         # Get top-k neighbors
         _, knn_ind = torch.topk(sim, self.knn_k, dim=-1)
         
-        # Create sparse adjacency matrix
-        rows = torch.arange(knn_ind.size(0)).view(-1, 1).repeat(1, self.knn_k).flatten()
+        # Create sparse adjacency matrix - ensure all tensors are on the same device
+        rows = torch.arange(knn_ind.size(0), device=self.device).view(-1, 1).repeat(1, self.knn_k).flatten()
         adj_size = sim.size()
         
-        # Compute normalized Laplacian
+        # Stack indices - both tensors now on same device
         indices = torch.stack([rows, knn_ind.flatten()])
-        values = torch.ones_like(indices[0].float())
-        adj = torch.sparse.FloatTensor(indices, values, adj_size)
+        values = torch.ones_like(indices[0].float(), device=self.device)
+        
+        # Create sparse tensor
+        adj = torch.sparse_coo_tensor(indices, values, adj_size, device=self.device)
         
         # Symmetric normalization
         row_sum = 1e-7 + torch.sparse.sum(adj, -1).to_dense()
@@ -137,7 +141,7 @@ class MMGAT(GeneralRecommender):
         cols_inv_sqrt = r_inv_sqrt[indices[1]]
         values = rows_inv_sqrt * cols_inv_sqrt
         
-        return indices, torch.sparse.FloatTensor(indices, values, adj_size)
+        return indices, torch.sparse_coo_tensor(indices, values, adj_size, device=self.device)
 
     def forward(self):
         """Forward propagation"""
