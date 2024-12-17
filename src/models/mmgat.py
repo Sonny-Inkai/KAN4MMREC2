@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.functional import cosine_similarity
-import torch_geometric
 from common.abstract_recommender import GeneralRecommender
 import scipy.sparse as sp
 import numpy as np
@@ -12,34 +11,38 @@ class MMGAT(GeneralRecommender):
         super(MMGAT, self).__init__(config, dataset)
         
         # Model hyperparameters
-        self.embedding_dim = 64
-        self.feat_embed_dim = 64
+        self.embedding_dim = config['embedding_size']
+        self.feat_embed_dim = config['feat_embed_dim']
         self.num_heads = 4
         self.dropout = 0.1
-        self.n_layers = 2
+        self.n_layers = config['n_layers']
         self.temperature = 0.2
-        self.lambda_coeff = 0.5
-        self.knn_k = 10
-        self.reg_weight = 1e-4
+        self.lambda_coeff = config['lambda_coeff']
+        self.knn_k = config['knn_k']
+        self.reg_weight = config['reg_weight']
         self.mm_fusion_mode = 'weight'
         self.n_nodes = self.n_users + self.n_items
+        self.alpha = 0.1
+        
+        # Load dataset info - following FREEDOM's implementation
+        self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
         
         # Initialize embeddings
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
         self.item_id_embedding = nn.Embedding(self.n_items, self.embedding_dim)
         nn.init.xavier_uniform_(self.user_embedding.weight)
         nn.init.xavier_uniform_(self.item_id_embedding.weight)
-
+        
         # Initialize feature transformations
         if self.v_feat is not None:
             self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
             self.image_trs = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
-            self.image_gat = GraphAttentionLayer(self.feat_embed_dim, self.feat_embed_dim, self.dropout, self.num_heads)
+            self.image_gat = GraphAttentionLayer(self.feat_embed_dim, self.feat_embed_dim, self.dropout, self.alpha)
         
         if self.t_feat is not None:
             self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
             self.text_trs = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
-            self.text_gat = GraphAttentionLayer(self.feat_embed_dim, self.feat_embed_dim, self.dropout, self.num_heads)
+            self.text_gat = GraphAttentionLayer(self.feat_embed_dim, self.feat_embed_dim, self.dropout, self.alpha)
 
         # Multimodal fusion weights
         if self.v_feat is not None and self.t_feat is not None:
@@ -50,39 +53,41 @@ class MMGAT(GeneralRecommender):
         self.norm_adj = self.get_norm_adj_mat().to(self.device)
         self.mm_adj = None
         self.build_item_graph = True
-        self.R = dataset.inter_matrix(form='coo').astype(np.float32).tolil()
 
     def get_norm_adj_mat(self):
-        def normalized_adj_single(adj):
-            rowsum = np.array(adj.sum(1))
-            d_inv = np.power(rowsum, -1).flatten()
-            d_inv[np.isinf(d_inv)] = 0.
-            d_mat_inv = sp.diags(d_inv)
-            norm_adj = d_mat_inv.dot(adj)
-            return norm_adj.tocoo()
-
-        adj_mat = sp.dok_matrix((self.n_users + self.n_items, self.n_users + self.n_items), dtype=np.float32)
-        adj_mat = adj_mat.tolil()
+        # Following FREEDOM's implementation
+        A = sp.dok_matrix((self.n_users + self.n_items, self.n_users + self.n_items), dtype=np.float32)
+        inter_M = self.interaction_matrix
+        inter_M_t = self.interaction_matrix.transpose()
+        data_dict = dict(zip(zip(inter_M.row, inter_M.col + self.n_users), [1] * inter_M.nnz))
+        data_dict.update(dict(zip(zip(inter_M_t.row + self.n_users, inter_M_t.col), [1] * inter_M_t.nnz)))
+        for key, value in data_dict.items():
+            A[key] = value
         
-        adj_mat[:self.n_users, self.n_users:] = self.R
-        adj_mat[self.n_users:, :self.n_users] = self.R.T
-        adj_mat = adj_mat.todok()
-
-        norm_adj_mat = normalized_adj_single(adj_mat + sp.eye(adj_mat.shape[0]))
-        return self._convert_sp_mat_to_tensor(norm_adj_mat)
-
-    def _convert_sp_mat_to_tensor(self, X):
-        coo = X.tocoo()
-        i = torch.LongTensor([coo.row, coo.col])
-        v = torch.FloatTensor(coo.data)
-        return torch.sparse.FloatTensor(i, v, torch.Size(coo.shape))
+        # norm adj matrix
+        sumArr = (A > 0).sum(axis=1)
+        # add epsilon to avoid Divide by zero Warning
+        diag = np.array(sumArr.flatten())[0] + 1e-7
+        diag = np.power(diag, -0.5)
+        D = sp.diags(diag)
+        L = D * A * D
+        
+        # convert norm_adj matrix to tensor
+        L = sp.coo_matrix(L)
+        row = L.row
+        col = L.col
+        i = torch.LongTensor([row, col])
+        data = torch.FloatTensor(L.data)
+        
+        return torch.sparse.FloatTensor(i, data, torch.Size((self.n_nodes, self.n_nodes)))
 
     def get_knn_adj_mat(self, mm_embeddings):
-        # Cosine similarity-based KNN graph
+        # Following BM3's implementation
         context_norm = mm_embeddings.div(torch.norm(mm_embeddings, p=2, dim=-1, keepdim=True))
         sim = torch.mm(context_norm, context_norm.transpose(1, 0))
         _, knn_ind = torch.topk(sim, self.knn_k, dim=-1)
         adj_size = sim.size()
+        del sim
         
         indices0 = torch.arange(knn_ind.shape[0]).to(self.device)
         indices0 = torch.unsqueeze(indices0, 1)
@@ -120,7 +125,7 @@ class MMGAT(GeneralRecommender):
                 learned_adj = weight[0] * self.image_adj + weight[1] * self.text_adj
             
             self.mm_adj = learned_adj
-        
+
         # Multi-layer Graph Attention
         ego_embeddings = torch.cat((self.user_embedding.weight, self.item_id_embedding.weight), dim=0)
         all_embeddings = [ego_embeddings]
@@ -154,17 +159,18 @@ class MMGAT(GeneralRecommender):
         neg_scores = torch.sum(u_embeddings * neg_embeddings, dim=1)
         bpr_loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
 
-        # Mirror Gradient Loss 
-        mirror_reg = torch.mean(torch.abs(torch.sign(u_embeddings.grad) + torch.sign(pos_embeddings.grad)))
+        # Mirror Gradient Loss
+        with torch.enable_grad():
+            mirror_reg = torch.mean(torch.abs(torch.sign(u_embeddings) + torch.sign(pos_embeddings)))
         
         # Contrastive Loss for multimodal features
-        contrastive_loss = torch.tensor(0.0).to(self.device)
+        contrastive_loss = torch.tensor(0.0, device=self.device)
         if self.v_feat is not None and self.t_feat is not None:
             image_feats = self.image_trs(self.image_embedding.weight[pos_items])
             text_feats = self.text_trs(self.text_embedding.weight[pos_items])
             
             sim_matrix = torch.matmul(image_feats, text_feats.t()) / self.temperature
-            labels = torch.arange(sim_matrix.size(0)).to(self.device)
+            labels = torch.arange(sim_matrix.size(0), device=self.device)
             contrastive_loss = F.cross_entropy(sim_matrix, labels) + F.cross_entropy(sim_matrix.t(), labels)
 
         # L2 regularization
