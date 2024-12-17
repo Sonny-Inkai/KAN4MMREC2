@@ -163,6 +163,7 @@ class MMGAT(GeneralRecommender):
 
         u_embeddings, i_embeddings = self.forward()
         
+        # First stage: Mirror gradient with gradient retention
         u_online = self.predictor(u_embeddings)
         i_online = self.predictor(i_embeddings)
         
@@ -173,28 +174,34 @@ class MMGAT(GeneralRecommender):
         pos_e = i_online[pos_items]
         neg_e = i_online[neg_items]
         
+        # Primary loss calculation
         pos_scores = torch.sum(torch.mul(u_e, pos_e), dim=1)
         neg_scores = torch.sum(torch.mul(u_e, neg_e), dim=1)
-        
         bpr_loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
 
-        pos_score = cosine_similarity(u_e, i_target[pos_items], dim=-1) / self.temperature
-        neg_score = cosine_similarity(u_e, i_target[neg_items], dim=-1) / self.temperature
-        contrastive_loss = -torch.mean(F.logsigmoid(pos_score - neg_score))
+        # Contrastive loss with separate computation
+        with torch.set_grad_enabled(True):
+            pos_score = cosine_similarity(u_e, i_target[pos_items], dim=-1) / self.temperature
+            neg_score = cosine_similarity(u_e, i_target[neg_items], dim=-1) / self.temperature
+            contrastive_loss = -torch.mean(F.logsigmoid(pos_score - neg_score))
 
+        # Modal alignment loss if applicable
         modal_loss = 0.0
         if self.v_feat is not None and self.t_feat is not None:
-            image_feats = self.image_trs(self.image_embedding.weight)
-            text_feats = self.text_trs(self.text_embedding.weight)
-            modal_loss = 1 - torch.mean(cosine_similarity(image_feats[pos_items], text_feats[pos_items]))
+            with torch.set_grad_enabled(True):
+                image_feats = self.image_trs(self.image_embedding.weight)
+                text_feats = self.text_trs(self.text_embedding.weight)
+                modal_loss = 1 - torch.mean(cosine_similarity(image_feats[pos_items], text_feats[pos_items]))
 
+        # L2 regularization with detached computation
         reg_loss = self.reg_weight * (
-            torch.norm(u_embeddings[users]) +
-            torch.norm(i_embeddings[pos_items]) + 
-            torch.norm(i_embeddings[neg_items])
+            torch.norm(u_embeddings[users].detach()) +
+            torch.norm(i_embeddings[pos_items].detach()) + 
+            torch.norm(i_embeddings[neg_items].detach())
         )
 
-        return bpr_loss + contrastive_loss + modal_loss + reg_loss
+        total_loss = bpr_loss + contrastive_loss + modal_loss + reg_loss
+        return total_loss
 
     def full_sort_predict(self, interaction):
         user = interaction[0]
