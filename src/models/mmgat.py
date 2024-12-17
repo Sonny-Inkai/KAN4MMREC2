@@ -61,12 +61,9 @@ class MMGAT(GeneralRecommender):
             norm_adj = d_mat_inv.dot(adj)
             return norm_adj.tocoo()
 
-        # Get interaction matrix directly from dataloader's dataset
-        interaction_matrix = self.dataset.inter_matrix(form='coo').astype(np.float32)
-        
         adj_mat = sp.dok_matrix((self.n_users + self.n_items, self.n_users + self.n_items), dtype=np.float32)
         adj_mat = adj_mat.tolil()
-        R = interaction_matrix.tolil()
+        R = self.dataset.inter_matrix(form='coo').astype(np.float32).tolil()
         adj_mat[:self.n_users, self.n_users:] = R
         adj_mat[self.n_users:, :self.n_users] = R.T
         adj_mat = adj_mat.todok()
@@ -157,7 +154,7 @@ class MMGAT(GeneralRecommender):
         neg_scores = torch.sum(u_embeddings * neg_embeddings, dim=1)
         bpr_loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
 
-        # Mirror Gradient Loss
+        # Mirror Gradient Loss 
         mirror_reg = torch.mean(torch.abs(torch.sign(u_embeddings.grad) + torch.sign(pos_embeddings.grad)))
         
         # Contrastive Loss for multimodal features
