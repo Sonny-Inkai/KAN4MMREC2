@@ -50,7 +50,7 @@ class MMGAT(GeneralRecommender):
         self.norm_adj = self.get_norm_adj_mat().to(self.device)
         self.mm_adj = None
         self.build_item_graph = True
-        self.dataset = dataset
+        self.R = dataset.inter_matrix(form='coo').astype(np.float32).tolil()
 
     def get_norm_adj_mat(self):
         def normalized_adj_single(adj):
@@ -63,9 +63,9 @@ class MMGAT(GeneralRecommender):
 
         adj_mat = sp.dok_matrix((self.n_users + self.n_items, self.n_users + self.n_items), dtype=np.float32)
         adj_mat = adj_mat.tolil()
-        R = self.dataset.inter_matrix(form='coo').astype(np.float32).tolil()
-        adj_mat[:self.n_users, self.n_users:] = R
-        adj_mat[self.n_users:, :self.n_users] = R.T
+        
+        adj_mat[:self.n_users, self.n_users:] = self.R
+        adj_mat[self.n_users:, :self.n_users] = self.R.T
         adj_mat = adj_mat.todok()
 
         norm_adj_mat = normalized_adj_single(adj_mat + sp.eye(adj_mat.shape[0]))
