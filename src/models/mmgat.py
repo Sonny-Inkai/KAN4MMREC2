@@ -61,6 +61,8 @@ class MMGAT(GeneralRecommender):
             nn.Linear(self.embedding_dim, self.embedding_dim)
         )
 
+        self.inter_mat = dataset.inter_matrix(form='coo').astype(np.float32)
+
     def init_mm_adj(self):
         mm_adj = None
         if self.v_feat is not None:
@@ -92,9 +94,9 @@ class MMGAT(GeneralRecommender):
 
     def get_norm_adj_mat(self):
         adj_mat = sp.dok_matrix((self.n_nodes, self.n_nodes), dtype=np.float32)
-        inter_mat = self.dataset.inter_matrix(form='coo').astype(np.float32)
-        adj_mat[:self.n_users, self.n_users:] = inter_mat
-        adj_mat[self.n_users:, :self.n_users] = inter_mat.T
+        
+        adj_mat[:self.n_users, self.n_users:] = self.inter_mat
+        adj_mat[self.n_users:, :self.n_users] = self.inter_mat.T
         
         rowsum = np.array(adj_mat.sum(axis=1))
         d_inv = np.power(rowsum + 1e-7, -0.5).flatten()
