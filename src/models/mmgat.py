@@ -21,9 +21,7 @@ class MMGAT(GeneralRecommender):
         self.knn_k = 10
         
         self.n_nodes = self.n_users + self.n_items
-        
-        # Device handling
-        self.device = self.config["device"]
+    
         
         self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
         
