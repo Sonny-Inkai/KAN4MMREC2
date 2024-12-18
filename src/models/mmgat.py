@@ -307,3 +307,48 @@ class MMGAT(GeneralRecommender):
         
         scores = torch.matmul(u_embeddings[user], i_embeddings.transpose(0, 1))
         return scores
+
+    def get_norm_adj_mat(self):
+        """Get normalized adjacency matrix"""
+        A = sp.dok_matrix((self.n_nodes, self.n_nodes), dtype=np.float32)
+        inter_M = self.interaction_matrix
+        inter_M_t = self.interaction_matrix.transpose()
+        data_dict = dict(zip(zip(inter_M.row, inter_M.col + self.n_users), [1] * inter_M.nnz))
+        data_dict.update(dict(zip(zip(inter_M_t.row + self.n_users, inter_M_t.col), [1] * inter_M_t.nnz)))
+        for key, value in data_dict.items():
+            A[key] = value
+        
+        sumArr = (A > 0).sum(axis=1)
+        diag = np.array(sumArr.flatten())[0] + 1e-7
+        diag = np.power(diag, -0.5)
+        D = sp.diags(diag)
+        L = D * A * D
+        L = sp.coo_matrix(L)
+        indices = torch.LongTensor(np.array([L.row, L.col]))
+        values = torch.FloatTensor(L.data)
+        return torch.sparse_coo_tensor(indices, values, torch.Size((self.n_nodes, self.n_nodes)))
+
+    def get_knn_adj_mat(self, mm_embeddings):
+        """Get KNN adjacency matrix"""
+        context_norm = F.normalize(mm_embeddings, p=2, dim=-1)
+        sim = torch.mm(context_norm, context_norm.transpose(1, 0))
+        _, knn_ind = torch.topk(sim, self.knn_k, dim=-1)
+        adj_size = sim.size()
+        del sim
+        
+        indices0 = torch.arange(knn_ind.shape[0], device=self.device)
+        indices0 = torch.unsqueeze(indices0, 1)
+        indices0 = indices0.expand(-1, self.knn_k)
+        indices = torch.stack((torch.flatten(indices0), torch.flatten(knn_ind)), 0)
+        
+        return indices, self.compute_normalized_laplacian(indices, adj_size)
+
+    def compute_normalized_laplacian(self, indices, adj_size):
+        """Compute normalized Laplacian"""
+        adj = torch.sparse_coo_tensor(indices, torch.ones_like(indices[0], device=self.device), adj_size)
+        row_sum = 1e-7 + torch.sparse.sum(adj, -1).to_dense()
+        r_inv_sqrt = torch.pow(row_sum, -0.5)
+        rows_inv_sqrt = r_inv_sqrt[indices[0]]
+        cols_inv_sqrt = r_inv_sqrt[indices[1]]
+        values = rows_inv_sqrt * cols_inv_sqrt
+        return torch.sparse_coo_tensor(indices, values, adj_size)
