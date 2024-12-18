@@ -7,7 +7,7 @@ import numpy as np
 from common.abstract_recommender import GeneralRecommender
 from common.loss import EmbLoss
 
-class GraphAttentionLayer(nn.Module):
+class SparseGraphAttention(nn.Module):
     def __init__(self, in_dim, out_dim, dropout=0.1, alpha=0.2):
         super().__init__()
         self.in_dim = in_dim
@@ -16,28 +16,35 @@ class GraphAttentionLayer(nn.Module):
         self.alpha = alpha
         
         self.W = nn.Parameter(torch.empty(size=(in_dim, out_dim)))
-        nn.init.xavier_uniform_(self.W.data)
-        
         self.a = nn.Parameter(torch.empty(size=(2*out_dim, 1)))
+        nn.init.xavier_uniform_(self.W.data)
         nn.init.xavier_uniform_(self.a.data)
         
-        self.leakyrelu = nn.LeakyReLU(self.alpha)
+        self.leakyrelu = nn.LeakyReLU(alpha)
     
-    def forward(self, h, adj):
-        Wh = torch.mm(h, self.W)
-        e = self._prepare_attentional_mechanism_input(Wh)
-        zero_vec = -9e15*torch.ones_like(e)
-        attention = torch.where(adj > 0, e, zero_vec)
-        attention = F.softmax(attention, dim=1)
-        attention = F.dropout(attention, self.dropout, training=self.training)
-        h_prime = torch.matmul(attention, Wh)
+    def forward(self, x, adj_t):
+        # x: [N, F], adj_t: sparse tensor
+        x = F.dropout(x, self.dropout, training=self.training)
+        h = torch.mm(x, self.W)
+        
+        # Compute attention scores for non-zero elements only
+        edge_index = adj_t._indices()
+        N = x.size(0)
+        
+        # Self-attention on the nodes
+        edge_h = torch.cat((h[edge_index[0]], h[edge_index[1]]), dim=1)
+        edge_e = self.leakyrelu(edge_h.mm(self.a))
+        
+        # Convert attention scores to sparse format
+        attention = torch.sparse_coo_tensor(
+            edge_index, 
+            F.softmax(edge_e.squeeze(), dim=0),
+            (N, N)
+        )
+        
+        # Apply attention to features
+        h_prime = torch.sparse.mm(attention, h)
         return F.elu(h_prime)
-    
-    def _prepare_attentional_mechanism_input(self, Wh):
-        Wh1 = torch.matmul(Wh, self.a[:self.out_dim, :])
-        Wh2 = torch.matmul(Wh, self.a[self.out_dim:, :])
-        e = Wh1 + Wh2.transpose(0,1)
-        return self.leakyrelu(e)
 
 class CrossModalAttention(nn.Module):
     def __init__(self, dim):
@@ -73,7 +80,6 @@ class MMGAT(GeneralRecommender):
         self.embedding_dim = config['embedding_size']
         self.feat_embed_dim = config['feat_embed_dim']
         self.n_layers = config['n_layers']
-        self.n_heads = 4
         self.dropout = config['dropout']
         self.reg_weight = config['reg_weight']
         self.temperature = 0.2
@@ -89,13 +95,14 @@ class MMGAT(GeneralRecommender):
         nn.init.xavier_uniform_(self.user_embedding.weight)
         nn.init.xavier_uniform_(self.item_embedding.weight)
         
-        # Modal encoders with attention
+        # Modal encoders
         if self.v_feat is not None:
             self.v_feat = self.v_feat.to(self.device)
             self.image_encoder = nn.Sequential(
                 nn.Linear(self.v_feat.shape[1], self.feat_embed_dim),
                 nn.LayerNorm(self.feat_embed_dim),
                 nn.GELU(),
+                nn.Dropout(self.dropout),
                 nn.Linear(self.feat_embed_dim, self.feat_embed_dim)
             )
             self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
@@ -106,63 +113,56 @@ class MMGAT(GeneralRecommender):
                 nn.Linear(self.t_feat.shape[1], self.feat_embed_dim),
                 nn.LayerNorm(self.feat_embed_dim),
                 nn.GELU(),
+                nn.Dropout(self.dropout),
                 nn.Linear(self.feat_embed_dim, self.feat_embed_dim)
             )
             self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
         
-        # Cross-modal attention
-        self.cross_attention = CrossModalAttention(self.feat_embed_dim)
-        
-        # Graph attention layers
+        # Graph attention layers with memory optimization
         self.gat_layers = nn.ModuleList([
-            GraphAttentionLayer(self.embedding_dim, self.embedding_dim, self.dropout)
+            SparseGraphAttention(self.embedding_dim, self.embedding_dim, self.dropout)
             for _ in range(self.n_layers)
         ])
         
-        # Projection head for contrastive learning
-        self.projector = nn.Sequential(
-            nn.Linear(self.embedding_dim, self.embedding_dim),
-            nn.LayerNorm(self.embedding_dim),
+        # Lightweight fusion layer
+        self.fusion = nn.Sequential(
+            nn.Linear(self.feat_embed_dim * 2, self.feat_embed_dim),
+            nn.LayerNorm(self.feat_embed_dim),
             nn.GELU(),
-            nn.Linear(self.embedding_dim, self.embedding_dim)
-        )
+            nn.Dropout(self.dropout)
+        ) if self.v_feat is not None and self.t_feat is not None else None
         
         self.to(self.device)
 
     def forward(self):
-        # Process modalities
-        modal_feats = []
+        # Process modalities with memory-efficient batching
         if self.v_feat is not None:
             img_feat = self.image_encoder(self.image_embedding.weight)
-            modal_feats.append(img_feat)
             
         if self.t_feat is not None:
             txt_feat = self.text_encoder(self.text_embedding.weight)
-            modal_feats.append(txt_feat)
         
-        # Cross-modal fusion with attention
-        if len(modal_feats) > 1:
-            fused_features = self.cross_attention(modal_feats[0], modal_feats[1])
-        elif len(modal_feats) == 1:
-            fused_features = modal_feats[0]
+        # Efficient modal fusion
+        if self.fusion is not None:
+            fused_features = self.fusion(torch.cat([img_feat, txt_feat], dim=-1))
         else:
-            fused_features = self.item_embedding.weight
+            fused_features = img_feat if self.v_feat is not None else txt_feat if self.t_feat is not None else None
         
-        # Graph attention with residual connections
+        # Memory-efficient graph attention
         ego_embeddings = torch.cat([self.user_embedding.weight, self.item_embedding.weight])
         all_embeddings = [ego_embeddings]
         
-        adj = self.norm_adj.to_dense()
         for gat_layer in self.gat_layers:
-            ego_embeddings = gat_layer(ego_embeddings, adj) + ego_embeddings
+            ego_embeddings = gat_layer(ego_embeddings, self.norm_adj)
             all_embeddings.append(ego_embeddings)
         
         all_embeddings = torch.stack(all_embeddings, dim=1)
         all_embeddings = torch.mean(all_embeddings, dim=1)
         u_g_embeddings, i_g_embeddings = torch.split(all_embeddings, [self.n_users, self.n_items])
         
-        # Enhance item embeddings with modal features
-        i_g_embeddings = i_g_embeddings + fused_features
+        # Combine with modal features if available
+        if fused_features is not None:
+            i_g_embeddings = i_g_embeddings + fused_features
         
         return u_g_embeddings, i_g_embeddings
 
@@ -173,46 +173,28 @@ class MMGAT(GeneralRecommender):
         
         u_embeddings, i_embeddings = self.forward()
         
-        # Project embeddings
-        u_embeddings = self.projector(u_embeddings)
-        i_embeddings = self.projector(i_embeddings)
-        
         u_e = u_embeddings[users]
         pos_e = i_embeddings[pos_items]
         neg_e = i_embeddings[neg_items]
         
-        # InfoNCE loss
-        pos_scores = torch.sum(u_e * pos_e, dim=1) / self.temperature
-        neg_scores = torch.sum(u_e * neg_e, dim=1) / self.temperature
+        # Efficient InfoNCE loss computation
+        pos_scores = torch.sum(u_e * pos_e, dim=1)
+        neg_scores = torch.sum(u_e * neg_e, dim=1)
         
-        loss_ce = -torch.mean(pos_scores - torch.logsumexp(torch.stack([pos_scores, neg_scores], dim=1), dim=1))
+        loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
         
-        # Hard negative mining
-        with torch.no_grad():
-            neg_candidates = torch.matmul(u_e, i_embeddings.t())
-            neg_candidates[users.unsqueeze(1) == torch.arange(self.n_items).to(self.device)] = -1e10
-            _, hard_neg_items = neg_candidates.topk(10, dim=1)
-            hard_neg_e = i_embeddings[hard_neg_items]
-        
-        hard_neg_scores = torch.sum(u_e.unsqueeze(1) * hard_neg_e, dim=2) / self.temperature
-        loss_hard = -torch.mean(pos_scores.unsqueeze(1) - torch.logsumexp(hard_neg_scores, dim=1))
-        
-        # Regularization
+        # L2 regularization
         reg_loss = self.reg_weight * (
             torch.norm(u_e) / len(users) +
             torch.norm(pos_e) / len(pos_items) +
             torch.norm(neg_e) / len(neg_items)
         )
         
-        return loss_ce + 0.1 * loss_hard + reg_loss
+        return loss + reg_loss
 
     def full_sort_predict(self, interaction):
         user = interaction[0]
-        
         u_embeddings, i_embeddings = self.forward()
-        u_embeddings = self.projector(u_embeddings)
-        i_embeddings = self.projector(i_embeddings)
-        
         scores = torch.matmul(u_embeddings[user], i_embeddings.transpose(0, 1))
         return scores
 
