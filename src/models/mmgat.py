@@ -8,56 +8,28 @@ from common.abstract_recommender import GeneralRecommender
 from common.loss import EmbLoss
 
 class FlashAttention(nn.Module):
-    def __init__(self, dim, num_heads=4, dropout=0.1, max_seq_len=2048):
+    def __init__(self, dim, num_heads=4, dropout=0.1):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
         
-        self.qkv = nn.Linear(dim, dim * 3, bias=False)
-        self.proj = nn.Linear(dim, dim, bias=False)
-        self.dropout = dropout
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.proj = nn.Linear(dim, dim)
+        self.dropout = nn.Dropout(dropout)
         
-        # Chunked attention parameters
-        self.chunk_size = 256  # Optimize for memory
-        self.max_seq_len = max_seq_len
-        
-    def forward(self, x, mask=None):
+    def forward(self, x):
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.unbind(2)  # B, N, H, D
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
         
-        # Chunked attention computation
-        out = torch.zeros_like(q)
-        softmax_max = torch.full((B, self.num_heads, N), float('-inf'), device=x.device)
-        softmax_sum = torch.zeros((B, self.num_heads, N), device=x.device)
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.dropout(attn)
         
-        for chunk_idx in range(0, N, self.chunk_size):
-            chunk_end = min(chunk_idx + self.chunk_size, N)
-            cur_chunk = slice(chunk_idx, chunk_end)
-            
-            # Current chunk attention scores
-            attn_weights = torch.matmul(q, k[:, cur_chunk].transpose(-2, -1)) * self.scale
-            
-            if mask is not None:
-                attn_weights = attn_weights.masked_fill(mask[:, :, cur_chunk] == 0, float('-inf'))
-            
-            # Update running max and sum for stable softmax
-            chunk_max = attn_weights.max(dim=-1, keepdim=True)[0]
-            exp_weights = torch.exp(attn_weights - chunk_max)
-            chunk_sum = exp_weights.sum(dim=-1, keepdim=True)
-            
-            # Update output with current chunk
-            exp_values = torch.matmul(exp_weights, v[:, cur_chunk])
-            out = out + exp_values * chunk_sum
-            
-            # Update running statistics
-            softmax_max = torch.maximum(softmax_max, chunk_max.squeeze(-1))
-            softmax_sum = softmax_sum + chunk_sum.squeeze(-1)
-        
-        out = out / softmax_sum.unsqueeze(-1)
-        out = self.proj(out.reshape(B, N, -1))
-        return out
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        return x
 
 class ModalFusionBlock(nn.Module):
     def __init__(self, dim, num_heads=4):
