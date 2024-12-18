@@ -7,10 +7,10 @@ feat_embed_dim: 64
 n_layers: 2
 
 # Dropout rates to prevent overfitting
-dropout: 0.3
+dropout: [0.1, 0.3, 0.5]
 
 # Regularization weights for different components
-reg_weight: 1e-4
+reg_weight: [1e-5, 1e-4, 1e-3]
 
 # Coefficient for multimodal weight
 mm_image_weight: 0.1
