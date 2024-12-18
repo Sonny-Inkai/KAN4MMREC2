@@ -4,12 +4,6 @@ import torch.nn.functional as F
 import numpy as np
 import scipy.sparse as sp
 from torch.nn.init import xavier_normal_
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.nn.functional import cosine_similarity
-
-from common.abstract_recommender import GeneralRecommender
-from common.loss import EmbLoss
 
 class MMGAT(GeneralRecommender):
     def __init__(self, config, dataset):
@@ -69,8 +63,7 @@ class MMGAT(GeneralRecommender):
         inter_M_t = self.interaction_matrix.transpose()
         data_dict = dict(zip(zip(inter_M.row, inter_M.col + self.n_users), [1] * inter_M.nnz))
         data_dict.update(dict(zip(zip(inter_M_t.row + self.n_users, inter_M_t.col), [1] * inter_M_t.nnz)))
-        for key, value in data_dict.items():
-            A[key] = value
+        A._update(data_dict)
         
         sumArr = (A > 0).sum(axis=1)
         diag = np.array(sumArr.flatten())[0] + 1e-7
@@ -85,11 +78,12 @@ class MMGAT(GeneralRecommender):
         return torch.sparse.FloatTensor(i, data, torch.Size((self.n_nodes, self.n_nodes)))
 
     def laplacian_normalize(self, features):
-        D = torch.sum(features, dim=1)
-        D_inv_sqrt = torch.pow(D + 1e-7, -0.5)
-        D_inv_sqrt = torch.diag_embed(D_inv_sqrt)
-        norm_features = torch.matmul(torch.matmul(D_inv_sqrt, features), D_inv_sqrt)
-        return norm_features
+        # Row-wise normalization
+        row_sum = features.sum(1, keepdim=True)
+        row_sum = torch.where(row_sum == 0, torch.ones_like(row_sum), row_sum)
+        d_inv_sqrt = torch.pow(row_sum, -0.5)
+        normalized_features = features * d_inv_sqrt
+        return normalized_features
 
     def mirror_gradient_update(self, features, alpha=0.5):
         forward_features = features.detach().clone()
@@ -127,10 +121,13 @@ class MMGAT(GeneralRecommender):
         else:
             fused_features = h
 
+        # Prepare attention inputs (need to transpose for attention layer)
+        fused_features = fused_features.unsqueeze(1).transpose(0, 1)
+        
         # Apply attention mechanism
         for attention in self.attention_layers:
-            fused_features = attention(fused_features, fused_features, fused_features)[0]
-            all_embeddings.append(ego_embeddings + fused_features)
+            attended_features, _ = attention(fused_features, fused_features, fused_features)
+            all_embeddings.append(ego_embeddings + attended_features.transpose(0, 1).squeeze(1))
 
         all_embeddings = torch.stack(all_embeddings, dim=1)
         all_embeddings = torch.mean(all_embeddings, dim=1)
@@ -153,7 +150,7 @@ class MMGAT(GeneralRecommender):
         pos_scores = torch.mul(u_embeddings, pos_embeddings).sum(dim=1)
         neg_scores = torch.mul(u_embeddings, neg_embeddings).sum(dim=1)
         
-        mf_loss = -torch.mean(torch.log(torch.sigmoid(pos_scores - neg_scores)))
+        mf_loss = -torch.mean(torch.log(torch.sigmoid(pos_scores - neg_scores) + 1e-7))
 
         # Regularization Loss
         reg_loss = self.reg_weight * (
