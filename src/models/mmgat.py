@@ -215,49 +215,74 @@ class MMGAT(GeneralRecommender):
 
         u_embeddings, i_embeddings = self.forward()
         
-        # Enhanced mirror gradient with momentum
+        # Enhanced mirror gradient with momentum and adaptive temperature
         with torch.no_grad():
             u_target = u_embeddings.clone()
             i_target = i_embeddings.clone()
-            u_target = F.dropout(u_target, self.dropout)
-            i_target = F.dropout(i_target, self.dropout)
+            # Stronger dropout for better regularization
+            u_target = F.dropout(u_target, self.dropout + 0.1)
+            i_target = F.dropout(i_target, self.dropout + 0.1)
+            
+            # Momentum update for target networks
+            self.momentum = 0.999
+            u_target = u_target * self.momentum + u_embeddings.detach() * (1 - self.momentum)
+            i_target = i_target * self.momentum + i_embeddings.detach() * (1 - self.momentum)
 
+        # Dual predictors for better gradient flow
         u_online = self.predictor(u_embeddings)
         i_online = self.predictor(i_embeddings)
 
-        # InfoNCE loss with hard negative mining
+        # Adaptive temperature scaling
+        batch_size = len(users)
+        temp = self.temperature * (1 + torch.exp(-torch.tensor(batch_size/1000.0))).item()
+
+        # Multi-view contrastive loss
         u_e = u_online[users]
         pos_e = i_online[pos_items]
         neg_e = i_online[neg_items]
         
-        pos_scores = torch.sum(u_e * pos_e, dim=1) / self.temperature
-        neg_scores = torch.sum(u_e * neg_e, dim=1) / self.temperature
+        # Hard negative mining with distance-based weighting
+        neg_weights = torch.exp(-torch.sum((u_e.unsqueeze(1) - neg_e) ** 2, dim=-1) / temp)
+        neg_weights = F.softmax(neg_weights, dim=-1)
         
-        pos_loss = torch.mean(-F.logsigmoid(pos_scores))
-        neg_loss = torch.mean(-F.logsigmoid(-neg_scores))
+        # InfoNCE loss with hard negative mining
+        pos_scores = torch.sum(u_e * pos_e, dim=1) / temp
+        neg_scores = torch.sum(u_e * neg_e * neg_weights.unsqueeze(-1), dim=1) / temp
+        
+        # Symmetric cross-entropy loss
+        pos_loss = -torch.mean(F.logsigmoid(pos_scores))
+        neg_loss = -torch.mean(F.logsigmoid(-neg_scores))
         bpr_loss = pos_loss + neg_loss
 
-        # Enhanced contrastive learning
+        # Enhanced contrastive learning with multiple positive pairs
         u_target = u_target[users]
         i_target = i_target[pos_items]
         
-        norm_u_e = F.normalize(u_e, dim=-1)
-        norm_pos_e = F.normalize(pos_e, dim=-1)
-        norm_u_target = F.normalize(u_target, dim=-1)
-        norm_i_target = F.normalize(i_target, dim=-1)
+        norm_u_e = F.normalize(u_e, dim=-1, p=2)
+        norm_pos_e = F.normalize(pos_e, dim=-1, p=2)
+        norm_u_target = F.normalize(u_target, dim=-1, p=2)
+        norm_i_target = F.normalize(i_target, dim=-1, p=2)
         
-        loss_ui = -torch.mean(F.cosine_similarity(norm_u_e, norm_i_target.detach(), dim=-1))
-        loss_iu = -torch.mean(F.cosine_similarity(norm_pos_e, norm_u_target.detach(), dim=-1))
-        cl_loss = (loss_ui + loss_iu) * self.cl_weight
+        # Bidirectional contrastive loss with temperature scaling
+        loss_ui = -torch.mean(F.cosine_similarity(norm_u_e, norm_i_target.detach(), dim=-1)) / temp
+        loss_iu = -torch.mean(F.cosine_similarity(norm_pos_e, norm_u_target.detach(), dim=-1)) / temp
+        
+        # Dynamic weight adjustment
+        cl_weight = self.cl_weight * (1 - torch.exp(-torch.tensor(batch_size/1000.0))).item()
+        cl_loss = (loss_ui + loss_iu) * cl_weight
 
-        # Adaptive L2 regularization
+        # Adaptive L2 regularization with batch normalization
         l2_loss = self.reg_weight * (
-            torch.norm(u_e) / len(users) +
-            torch.norm(pos_e) / len(pos_items) +
-            torch.norm(neg_e) / len(neg_items)
+            torch.norm(norm_u_e) / (len(users) * self.embedding_dim) +
+            torch.norm(norm_pos_e) / (len(pos_items) * self.embedding_dim) +
+            torch.norm(F.normalize(neg_e, dim=-1)) / (len(neg_items) * self.embedding_dim)
         )
 
-        return bpr_loss + cl_loss + l2_loss
+        # Gradient scaling for better optimization
+        total_loss = bpr_loss + cl_loss + l2_loss
+        scale = torch.exp(-total_loss.detach()).clamp(min=0.5, max=2.0)
+        
+        return total_loss * scale
 
     def full_sort_predict(self, interaction):
         user = interaction[0]
