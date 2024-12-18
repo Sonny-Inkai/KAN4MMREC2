@@ -87,19 +87,29 @@ class MMGAT(GeneralRecommender):
         return edges, values
 
     def _normalize_adj_values(self, edges):
+        """
+        Normalize adjacency matrix values using symmetric normalization
+        """
         adj = torch.sparse.FloatTensor(
             edges, 
             torch.ones(edges.size(1)),
             torch.Size([self.n_users, self.n_items])
         )
         
-        row_sum = 1e-7 + torch.sparse.sum(adj, -1).to_dense()
-        col_sum = 1e--7 + torch.sparse.sum(adj.t(), -1).to_dense()
+        # Add small epsilon to avoid division by zero
+        epsilon = 1e-7
         
+        # Calculate row and column sums
+        row_sum = epsilon + torch.sparse.sum(adj, -1).to_dense()
+        col_sum = epsilon + torch.sparse.sum(adj.t(), -1).to_dense()
+        
+        # Calculate inverse square root of degrees
         r_inv_sqrt = torch.pow(row_sum, -0.5)
         c_inv_sqrt = torch.pow(col_sum, -0.5)
         
+        # Calculate normalized values
         values = r_inv_sqrt[edges[0]] * c_inv_sqrt[edges[1]]
+        
         return values
 
     def initialize_mm_adj(self):
