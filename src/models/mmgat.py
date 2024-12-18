@@ -215,70 +215,101 @@ class MMGAT(GeneralRecommender):
 
         u_embeddings, i_embeddings = self.forward()
         
-        # Enhanced mirror gradient with momentum and adaptive temperature
+        # Multi-view contrastive learning with momentum encoder
         with torch.no_grad():
-            u_target = u_embeddings.clone()
-            i_target = i_embeddings.clone()
-            # Stronger dropout for better regularization
-            u_target = F.dropout(u_target, self.dropout + 0.1)
-            i_target = F.dropout(i_target, self.dropout + 0.1)
-            
             # Momentum update for target networks
-            self.momentum = 0.999
-            u_target = u_target * self.momentum + u_embeddings.detach() * (1 - self.momentum)
-            i_target = i_target * self.momentum + i_embeddings.detach() * (1 - self.momentum)
+            self.momentum = min(1 - 1/(self.n_layers + 1), 0.999)
+            
+            u_target = u_embeddings.detach()
+            i_target = i_embeddings.detach()
+            
+            # Stronger stochastic augmentation
+            u_target = F.dropout(u_target, self.dropout * 1.5)
+            i_target = F.dropout(i_target, self.dropout * 1.5)
+            
+            # Feature augmentation for modalities
+            if self.v_feat is not None:
+                v_feat_target = self.image_encoder(self.image_embedding.weight).detach()
+                v_feat_target = F.dropout(v_feat_target, self.dropout)
+                
+            if self.t_feat is not None:
+                t_feat_target = self.text_encoder(self.text_embedding.weight).detach()
+                t_feat_target = F.dropout(t_feat_target, self.dropout)
 
-        # Dual predictors for better gradient flow
+        # Online network predictions
         u_online = self.predictor(u_embeddings)
         i_online = self.predictor(i_embeddings)
-
+        
         # Adaptive temperature scaling
         batch_size = len(users)
-        temp = self.temperature * (1 + torch.exp(-torch.tensor(batch_size/1000.0))).item()
+        temp = self.temperature * (1 + torch.exp(-torch.tensor(batch_size/500.0))).item()
 
-        # Multi-view contrastive loss
+        # Multi-view InfoNCE loss with hard negative mining
         u_e = u_online[users]
         pos_e = i_online[pos_items]
         neg_e = i_online[neg_items]
         
-        # Hard negative mining with distance-based weighting
+        # Distance-based negative sampling weights
         neg_weights = torch.exp(-torch.sum((u_e.unsqueeze(1) - neg_e) ** 2, dim=-1) / temp)
         neg_weights = F.softmax(neg_weights, dim=-1)
         
-        # InfoNCE loss with hard negative mining
+        # Compute scores with weighted negatives
         pos_scores = torch.sum(u_e * pos_e, dim=1) / temp
         neg_scores = torch.sum(u_e * neg_e * neg_weights.unsqueeze(-1), dim=1) / temp
-        
-        # Symmetric cross-entropy loss
+
+        # Bidirectional cross-entropy loss
         pos_loss = -torch.mean(F.logsigmoid(pos_scores))
         neg_loss = -torch.mean(F.logsigmoid(-neg_scores))
         bpr_loss = pos_loss + neg_loss
 
-        # Enhanced contrastive learning with multiple positive pairs
+        # Enhanced multi-modal contrastive learning
         u_target = u_target[users]
         i_target = i_target[pos_items]
         
-        norm_u_e = F.normalize(u_e, dim=-1, p=2)
-        norm_pos_e = F.normalize(pos_e, dim=-1, p=2)
-        norm_u_target = F.normalize(u_target, dim=-1, p=2)
-        norm_i_target = F.normalize(i_target, dim=-1, p=2)
+        # L2 normalization for embeddings
+        norm_u_e = F.normalize(u_e, dim=-1)
+        norm_pos_e = F.normalize(pos_e, dim=-1)
+        norm_u_target = F.normalize(u_target, dim=-1)
+        norm_i_target = F.normalize(i_target, dim=-1)
         
-        # Bidirectional contrastive loss with temperature scaling
+        # Multi-modal alignment loss
+        modal_loss = 0.0
+        if self.v_feat is not None:
+            v_feat_online = self.predictor(self.image_encoder(self.image_embedding.weight))
+            v_feat_online = v_feat_online[pos_items]
+            v_feat_target = v_feat_target[pos_items]
+            modal_loss += -torch.mean(F.cosine_similarity(
+                F.normalize(v_feat_online, dim=-1),
+                F.normalize(v_feat_target, dim=-1).detach(),
+                dim=-1
+            ))
+            
+        if self.t_feat is not None:
+            t_feat_online = self.predictor(self.text_encoder(self.text_embedding.weight))
+            t_feat_online = t_feat_online[pos_items]
+            t_feat_target = t_feat_target[pos_items]
+            modal_loss += -torch.mean(F.cosine_similarity(
+                F.normalize(t_feat_online, dim=-1),
+                F.normalize(t_feat_target, dim=-1).detach(),
+                dim=-1
+            ))
+        
+        # Bidirectional contrastive loss with dynamic temperature
         loss_ui = -torch.mean(F.cosine_similarity(norm_u_e, norm_i_target.detach(), dim=-1)) / temp
         loss_iu = -torch.mean(F.cosine_similarity(norm_pos_e, norm_u_target.detach(), dim=-1)) / temp
         
-        # Dynamic weight adjustment
-        cl_weight = self.cl_weight * (1 - torch.exp(-torch.tensor(batch_size/1000.0))).item()
-        cl_loss = (loss_ui + loss_iu) * cl_weight
+        # Dynamic weight adjustment based on training progress
+        cl_weight = self.cl_weight * (1 - torch.exp(-torch.tensor(batch_size/500.0))).item()
+        cl_loss = (loss_ui + loss_iu + modal_loss) * cl_weight
 
-        # Adaptive L2 regularization with batch normalization
+        # Adaptive L2 regularization
         l2_loss = self.reg_weight * (
             torch.norm(norm_u_e) / (len(users) * self.embedding_dim) +
             torch.norm(norm_pos_e) / (len(pos_items) * self.embedding_dim) +
             torch.norm(F.normalize(neg_e, dim=-1)) / (len(neg_items) * self.embedding_dim)
         )
 
-        # Gradient scaling for better optimization
+        # Gradient scaling for stable optimization
         total_loss = bpr_loss + cl_loss + l2_loss
         scale = torch.exp(-total_loss.detach()).clamp(min=0.5, max=2.0)
         
