@@ -14,17 +14,17 @@ class PHOENIX(GeneralRecommender):
     def __init__(self, config, dataset):
         super(PHOENIX, self).__init__(config, dataset)
 
-        self.embedding_dim = config["embedding_size"]
-        self.feat_embed_dim = config["feat_embed_dim"]
-        self.knn_k = config["knn_k"] 
-        self.lambda_coeff = config["lambda_coeff"]
-        self.n_layers = config["n_mm_layers"]
-        self.reg_weight = config["reg_weight"]
-        self.contrast_weight = config["contrast_weight"]
-        self.dropout = config["dropout"]
-        self.mm_fusion_mode = config["mm_fusion_mode"]
-        self.n_ui_layers = config["n_ui_layers"]
-        self.temp = config["temp"]
+        self.embedding_dim = 128
+        self.feat_embed_dim = 128
+        self.knn_k = 10
+        self.lambda_coeff = 0.001
+        self.n_layers = 2
+        self.reg_weight = 0.001
+        self.contrast_weight = 0.001
+        self.dropout = 0.5
+        self.mm_fusion_mode = "concat"
+        self.n_ui_layers = 2
+        self.temp = 0.1
         
         self.n_nodes = self.n_users + self.n_items
 

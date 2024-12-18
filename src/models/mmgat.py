@@ -10,16 +10,22 @@ class MMGAT(GeneralRecommender):
     def __init__(self, config, dataset):
         super(MMGAT, self).__init__(config, dataset)
         
-        self.embedding_dim = config['embedding_size']
-        self.feat_embed_dim = config['feat_embed_dim']
-        self.n_layers = config['n_layers']
-        self.dropout = config['dropout']
-        self.reg_weight = config['reg_weight']
+        self.embedding_dim = 64 
+        self.feat_embed_dim = 64
+        self.n_layers = 2
+        self.dropout = 0.3
+        self.reg_weight = 1e-4
         self.n_nodes = self.n_users + self.n_items
+        self.knn_k = 10
+        self.lambda_coeff = 0.9
+        self.cl_weight = 0.1
+        self.mm_image_weight = 0.1
+        self.degree_ratio = 0.8
         
         # Load dataset info
         self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
         self.norm_adj = self.get_norm_adj_mat().to(self.device)
+        self.mm_adj = None
         
         # User and item embeddings
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
@@ -30,41 +36,29 @@ class MMGAT(GeneralRecommender):
         # Multi-modal feature processors
         if self.v_feat is not None:
             self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
-            self.image_encoder = nn.Sequential(
-                nn.Linear(self.v_feat.shape[1], self.feat_embed_dim),
-                nn.LayerNorm(self.feat_embed_dim),
-                nn.ReLU(),
-                nn.Dropout(self.dropout)
-            )
-            self.image_projector = nn.Linear(self.feat_embed_dim, self.embedding_dim)
+            self.image_trs = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
+            nn.init.xavier_normal_(self.image_trs.weight)
             
         if self.t_feat is not None:
             self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
-            self.text_encoder = nn.Sequential(
-                nn.Linear(self.t_feat.shape[1], self.feat_embed_dim),
-                nn.LayerNorm(self.feat_embed_dim),
-                nn.ReLU(),
-                nn.Dropout(self.dropout)
-            )
-            self.text_projector = nn.Linear(self.feat_embed_dim, self.embedding_dim)
-        
-        # Graph attention layers
-        self.gnn_layers = nn.ModuleList([
-            LightGCNLayer(self.embedding_dim) 
-            for _ in range(self.n_layers)
-        ])
-        
-        # Modal fusion
-        self.modal_fusion = nn.Sequential(
-            nn.Linear(self.embedding_dim * 2, self.embedding_dim),
-            nn.ReLU(),
-            nn.Dropout(self.dropout),
-            nn.Linear(self.embedding_dim, self.embedding_dim)
-        ) if self.v_feat is not None and self.t_feat is not None else None
-        
-        # Adaptive weights
-        self.adaptive_weight = nn.Parameter(torch.ones(3) / 3)
-        self.softmax = nn.Softmax(dim=0)
+            self.text_trs = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
+            nn.init.xavier_normal_(self.text_trs.weight)
+
+        # Initialize multimodal adjacency matrix
+        if self.v_feat is not None:
+            indices, image_adj = self.get_knn_adj_mat(self.image_embedding.weight.detach())
+            self.mm_adj = image_adj
+        if self.t_feat is not None:
+            indices, text_adj = self.get_knn_adj_mat(self.text_embedding.weight.detach())
+            self.mm_adj = text_adj
+        if self.v_feat is not None and self.t_feat is not None:
+            self.mm_adj = self.mm_image_weight * image_adj + (1.0 - self.mm_image_weight) * text_adj
+            del text_adj
+            del image_adj
+
+        # Mirror gradient components
+        self.predictor = nn.Linear(self.embedding_dim, self.embedding_dim)
+        nn.init.xavier_normal_(self.predictor.weight)
         
     def get_norm_adj_mat(self):
         adj_mat = sp.dok_matrix((self.n_nodes, self.n_nodes), dtype=np.float32)
@@ -82,96 +76,99 @@ class MMGAT(GeneralRecommender):
         
         norm_adj = d_mat_inv.dot(adj_mat.dot(d_mat_inv))
         return self._sparse_mx_to_torch_sparse_tensor(norm_adj.tocoo())
-    
+
+    def get_knn_adj_mat(self, mm_embeddings):
+        context_norm = mm_embeddings.div(torch.norm(mm_embeddings, p=2, dim=-1, keepdim=True))
+        sim = torch.mm(context_norm, context_norm.transpose(1, 0))
+        _, knn_ind = torch.topk(sim, self.knn_k, dim=-1)
+        adj_size = sim.size()
+        del sim
+        
+        indices0 = torch.arange(knn_ind.shape[0]).to(self.device)
+        indices0 = torch.unsqueeze(indices0, 1)
+        indices0 = indices0.expand(-1, self.knn_k)
+        indices = torch.stack((torch.flatten(indices0), torch.flatten(knn_ind)), 0)
+        
+        return indices, self.compute_normalized_laplacian(indices, adj_size)
+
+    def compute_normalized_laplacian(self, indices, adj_size):
+        adj = torch.sparse.FloatTensor(indices, torch.ones_like(indices[0]), adj_size)
+        row_sum = 1e-7 + torch.sparse.sum(adj, -1).to_dense()
+        r_inv_sqrt = torch.pow(row_sum, -0.5)
+        rows_inv_sqrt = r_inv_sqrt[indices[0]]
+        cols_inv_sqrt = r_inv_sqrt[indices[1]]
+        values = rows_inv_sqrt * cols_inv_sqrt
+        return torch.sparse.FloatTensor(indices, values, adj_size)
+
     def _sparse_mx_to_torch_sparse_tensor(self, sparse_mx):
         sparse_mx = sparse_mx.tocoo().astype(np.float32)
         indices = torch.from_numpy(np.vstack((sparse_mx.row, sparse_mx.col))).long()
         values = torch.from_numpy(sparse_mx.data)
         shape = torch.Size(sparse_mx.shape)
         return torch.sparse.FloatTensor(indices, values, shape)
-    
+
     def forward(self):
-        # Process multi-modal features
-        modal_embeds = []
-        if self.v_feat is not None:
-            image_feats = self.image_encoder(self.image_embedding.weight)
-            image_embeds = self.image_projector(image_feats)
-            modal_embeds.append(image_embeds)
+        h = self.item_id_embedding.weight
+        for i in range(self.n_layers):
+            h = torch.sparse.mm(self.mm_adj, h)
             
-        if self.t_feat is not None:
-            text_feats = self.text_encoder(self.text_embedding.weight)
-            text_embeds = self.text_projector(text_feats)
-            modal_embeds.append(text_embeds)
-        
-        # Combine modal embeddings if both exist
-        if len(modal_embeds) == 2:
-            item_modal_embeds = self.modal_fusion(
-                torch.cat([modal_embeds[0], modal_embeds[1]], dim=-1)
-            )
-        elif len(modal_embeds) == 1:
-            item_modal_embeds = modal_embeds[0]
-        else:
-            item_modal_embeds = torch.zeros_like(self.item_id_embedding.weight)
-        
-        # Graph neural network
         ego_embeddings = torch.cat((self.user_embedding.weight, self.item_id_embedding.weight), dim=0)
         all_embeddings = [ego_embeddings]
         
-        for gnn in self.gnn_layers:
-            ego_embeddings = gnn(ego_embeddings, self.norm_adj)
+        for i in range(self.n_layers):
+            ego_embeddings = torch.sparse.mm(self.norm_adj, ego_embeddings)
             all_embeddings.append(ego_embeddings)
             
         all_embeddings = torch.stack(all_embeddings, dim=1)
-        all_embeddings = torch.mean(all_embeddings, dim=1)
-        
+        all_embeddings = all_embeddings.mean(dim=1, keepdim=False)
         u_g_embeddings, i_g_embeddings = torch.split(all_embeddings, [self.n_users, self.n_items], dim=0)
         
-        # Adaptive fusion
-        weights = self.softmax(self.adaptive_weight)
-        i_embeddings = weights[0] * i_g_embeddings + \
-                      weights[1] * item_modal_embeds + \
-                      weights[2] * self.item_id_embedding.weight
-        
-        return u_g_embeddings, i_embeddings
-    
+        return u_g_embeddings, i_g_embeddings + h
+
     def calculate_loss(self, interaction):
         users = interaction[0]
         pos_items = interaction[1]
         neg_items = interaction[2]
+
+        u_online_ori, i_online_ori = self.forward()
         
-        u_embeddings, i_embeddings = self.forward()
-        
-        u_embeddings = u_embeddings[users]
-        pos_embeddings = i_embeddings[pos_items]
-        neg_embeddings = i_embeddings[neg_items]
-        
-        # BPR loss
-        pos_scores = torch.sum(u_embeddings * pos_embeddings, dim=1)
-        neg_scores = torch.sum(u_embeddings * neg_embeddings, dim=1)
+        # Mirror gradient
+        with torch.no_grad():
+            u_target = u_online_ori.clone()
+            i_target = i_online_ori.clone()
+            u_target = F.dropout(u_target, self.dropout)
+            i_target = F.dropout(i_target, self.dropout)
+
+        u_online = self.predictor(u_online_ori)
+        i_online = self.predictor(i_online_ori)
+
+        u_online = u_online[users]
+        i_online = i_online[pos_items]
+        u_target = u_target[users]
+        i_target = i_target[pos_items]
+        neg_i_online = i_online[neg_items]
+
+        # BPR Loss
+        pos_scores = torch.sum(u_online * i_target.detach(), dim=1)
+        neg_scores = torch.sum(u_online * neg_i_online, dim=1)
         bpr_loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
-        
+
+        # Contrastive Loss
+        loss_ui = 1 - F.cosine_similarity(u_online, i_target.detach(), dim=-1).mean()
+        loss_iu = 1 - F.cosine_similarity(i_online, u_target.detach(), dim=-1).mean()
+        cl_loss = (loss_ui + loss_iu) * self.cl_weight
+
         # L2 regularization
-        reg_loss = self.reg_weight * (
-            torch.norm(u_embeddings) +
-            torch.norm(pos_embeddings) +
-            torch.norm(neg_embeddings)
-        )
-        
-        return bpr_loss + reg_loss
-    
+        l2_loss = self.reg_weight * (torch.norm(u_online_ori) + torch.norm(i_online_ori))
+
+        return bpr_loss + cl_loss + l2_loss
+
     def full_sort_predict(self, interaction):
         user = interaction[0]
         
-        u_embeddings, i_embeddings = self.forward()
-        u_embeddings = u_embeddings[user]
+        u_online, i_online = self.forward()
+        u_online = self.predictor(u_online)
+        i_online = self.predictor(i_online)
         
-        scores = torch.matmul(u_embeddings, i_embeddings.transpose(0, 1))
+        scores = torch.matmul(u_online[user], i_online.transpose(0, 1))
         return scores
-
-class LightGCNLayer(nn.Module):
-    def __init__(self, embedding_dim):
-        super(LightGCNLayer, self).__init__()
-        self.embedding_dim = embedding_dim
-        
-    def forward(self, x, adj):
-        return torch.sparse.mm(adj, x)
