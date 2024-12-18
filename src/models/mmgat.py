@@ -14,7 +14,7 @@ class MMGAT(GeneralRecommender):
         self.embedding_dim = config['embedding_size']
         self.feat_embed_dim = config['feat_embed_dim']
         self.n_layers = config['n_layers']
-        self.num_heads = config['num_heads']
+        self.num_heads = config['n_heads']
         self.dropout = config['dropout']
         self.reg_weight = config['reg_weight']
         self.temperature = config['temperature']
