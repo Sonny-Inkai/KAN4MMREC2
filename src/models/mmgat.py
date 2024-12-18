@@ -64,7 +64,8 @@ class MMGAT(GeneralRecommender):
         # Create dictionary of interactions
         data_dict = dict(zip(zip(inter_M.row, inter_M.col + self.n_users), [1] * inter_M.nnz))
         data_dict.update(dict(zip(zip(inter_M_t.row + self.n_users, inter_M_t.col), [1] * inter_M_t.nnz)))
-        A._update(data_dict)
+        for key, value in data_dict.items():
+            A[key] = value
 
         # Add self-loops and normalize
         A = A.tocoo().tocsr()
