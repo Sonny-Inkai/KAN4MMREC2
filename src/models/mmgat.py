@@ -5,6 +5,13 @@ import scipy.sparse as sp
 import numpy as np
 import copy
 
+import torch.nn.functional as F
+from torch.nn.functional import cosine_similarity
+
+from common.abstract_recommender import GeneralRecommender
+from common.loss import EmbLoss
+
+
 class ResidualTransformer(nn.Module):
     def __init__(self, dim, n_heads=8, dropout=0.1):
         super().__init__()
