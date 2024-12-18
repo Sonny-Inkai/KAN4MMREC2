@@ -1,8 +1,17 @@
+
+
+import os
+import copy
+import random
+import numpy as np
+import scipy.sparse as sp
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from mmrec.models.general_recommender import GeneralRecommender
+from torch.nn.functional import cosine_similarity
 
+from common.abstract_recommender import GeneralRecommender
+from common.loss import EmbLoss
 class MMGAT(GeneralRecommender):
     def __init__(self, config, dataset):
         super(MMGAT, self).__init__(config, dataset)
