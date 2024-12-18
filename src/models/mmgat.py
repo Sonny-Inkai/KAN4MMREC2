@@ -1,19 +1,16 @@
-import os
-import copy
-import random
-import numpy as np
-import scipy.sparse as sp
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.functional import cosine_similarity
-
-from common.abstract_recommender import GeneralRecommender
-from common.loss import EmbLoss
+import numpy as np
+import scipy.sparse as sp
+from torch.nn.init import xavier_normal_
 
 class MMGAT(GeneralRecommender):
     def __init__(self, config, dataset):
         super(MMGAT, self).__init__(config, dataset)
+
+        # Basic setup
+        self.n_nodes = self.n_users + self.n_items
 
         # Hyperparameters
         self.embedding_dim = 64
@@ -66,8 +63,7 @@ class MMGAT(GeneralRecommender):
         inter_M_t = self.interaction_matrix.transpose()
         data_dict = dict(zip(zip(inter_M.row, inter_M.col + self.n_users), [1] * inter_M.nnz))
         data_dict.update(dict(zip(zip(inter_M_t.row + self.n_users, inter_M_t.col), [1] * inter_M_t.nnz)))
-        for key, value in data_dict.items():
-            A[key] = value
+        A._update(data_dict)
         
         sumArr = (A > 0).sum(axis=1)
         diag = np.array(sumArr.flatten())[0] + 1e-7
