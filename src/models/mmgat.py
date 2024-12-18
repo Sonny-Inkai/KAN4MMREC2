@@ -49,17 +49,17 @@ class MMGAT(GeneralRecommender):
     def __init__(self, config, dataset):
         super(MMGAT, self).__init__(config, dataset)
         
-        self.embedding_dim = config['embedding_size']
-        self.feat_embed_dim = config['feat_embed_dim']
-        self.n_layers = config['n_layers']
-        self.n_mm_layers = config['n_mm_layers']
-        self.dropout = config['dropout']
-        self.reg_weight = config['reg_weight']
-        self.knn_k = config['knn_k']
-        self.lambda_coeff = config['lambda_coeff']
-        self.cl_weight = config['cl_weight']
-        self.mm_image_weight = config['mm_image_weight']
-        self.temperature = config['temperature']
+        self.embedding_dim = 64
+        self.feat_embed_dim = 64
+        self.n_layers = 3
+        self.n_mm_layers = 2
+        self.dropout = 0.5
+        self.reg_weight = 1e-4
+        self.knn_k = 20
+        self.lambda_coeff = 0.5
+        self.cl_weight = 0.1
+        self.mm_image_weight = 0.5
+        self.temperature = 0.2
         self.n_nodes = self.n_users + self.n_items
         
         # Load dataset info
