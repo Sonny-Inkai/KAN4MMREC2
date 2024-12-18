@@ -3,38 +3,68 @@ import torch.nn as nn
 import torch.nn.functional as F
 import scipy.sparse as sp
 import numpy as np
-import copy
-
-import torch.nn.functional as F
-from torch.nn.functional import cosine_similarity
 
 from common.abstract_recommender import GeneralRecommender
 from common.loss import EmbLoss
 
-
-class ResidualTransformer(nn.Module):
-    def __init__(self, dim, n_heads=8, dropout=0.1):
+class GraphAttentionLayer(nn.Module):
+    def __init__(self, in_dim, out_dim, dropout=0.1, alpha=0.2):
         super().__init__()
-        self.attn = nn.MultiheadAttention(dim, n_heads, dropout=dropout, batch_first=True)
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(dim, 4 * dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(4 * dim, dim)
-        )
-        self.dropout = nn.Dropout(dropout)
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.dropout = dropout
+        self.alpha = alpha
         
-    def forward(self, x):
-        residual = x
-        x = self.norm1(x)
-        attn_out, _ = self.attn(x, x, x)
-        x = residual + self.dropout(attn_out)
-        residual = x
-        x = self.norm2(x)
-        x = residual + self.dropout(self.ffn(x))
-        return x
+        self.W = nn.Parameter(torch.empty(size=(in_dim, out_dim)))
+        nn.init.xavier_uniform_(self.W.data)
+        
+        self.a = nn.Parameter(torch.empty(size=(2*out_dim, 1)))
+        nn.init.xavier_uniform_(self.a.data)
+        
+        self.leakyrelu = nn.LeakyReLU(self.alpha)
+    
+    def forward(self, h, adj):
+        Wh = torch.mm(h, self.W)
+        e = self._prepare_attentional_mechanism_input(Wh)
+        zero_vec = -9e15*torch.ones_like(e)
+        attention = torch.where(adj > 0, e, zero_vec)
+        attention = F.softmax(attention, dim=1)
+        attention = F.dropout(attention, self.dropout, training=self.training)
+        h_prime = torch.matmul(attention, Wh)
+        return F.elu(h_prime)
+    
+    def _prepare_attentional_mechanism_input(self, Wh):
+        Wh1 = torch.matmul(Wh, self.a[:self.out_dim, :])
+        Wh2 = torch.matmul(Wh, self.a[self.out_dim:, :])
+        e = Wh1 + Wh2.transpose(0,1)
+        return self.leakyrelu(e)
+
+class CrossModalAttention(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.query = nn.Linear(dim, dim)
+        self.key = nn.Linear(dim, dim)
+        self.value = nn.Linear(dim, dim)
+        self.scale = dim ** -0.5
+        self.gate = nn.Sequential(
+            nn.Linear(dim*2, dim),
+            nn.LayerNorm(dim),
+            nn.GELU(),
+            nn.Linear(dim, dim),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, x1, x2):
+        q = self.query(x1)
+        k = self.key(x2)
+        v = self.value(x2)
+        
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn = F.softmax(attn, dim=-1)
+        out = torch.matmul(attn, v)
+        
+        gate = self.gate(torch.cat([x1, out], dim=-1))
+        return x1 + gate * out
 
 class MMGAT(GeneralRecommender):
     def __init__(self, config, dataset):
@@ -43,27 +73,29 @@ class MMGAT(GeneralRecommender):
         self.embedding_dim = config['embedding_size']
         self.feat_embed_dim = config['feat_embed_dim']
         self.n_layers = config['n_layers']
+        self.n_heads = 4
         self.dropout = config['dropout']
         self.reg_weight = config['reg_weight']
-        self.n_heads = 8
-        self.temperature = 0.07
+        self.temperature = 0.2
         self.n_nodes = self.n_users + self.n_items
         
+        # Load interaction matrix
         self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
         self.norm_adj = self.get_norm_adj_mat().to(self.device)
         
+        # Core embeddings
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
         self.item_embedding = nn.Embedding(self.n_items, self.embedding_dim)
-        nn.init.normal_(self.user_embedding.weight, std=0.1)
-        nn.init.normal_(self.item_embedding.weight, std=0.1)
+        nn.init.xavier_uniform_(self.user_embedding.weight)
+        nn.init.xavier_uniform_(self.item_embedding.weight)
         
+        # Modal encoders with attention
         if self.v_feat is not None:
             self.v_feat = self.v_feat.to(self.device)
             self.image_encoder = nn.Sequential(
                 nn.Linear(self.v_feat.shape[1], self.feat_embed_dim),
                 nn.LayerNorm(self.feat_embed_dim),
                 nn.GELU(),
-                ResidualTransformer(self.feat_embed_dim, self.n_heads, self.dropout),
                 nn.Linear(self.feat_embed_dim, self.feat_embed_dim)
             )
             self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
@@ -74,58 +106,31 @@ class MMGAT(GeneralRecommender):
                 nn.Linear(self.t_feat.shape[1], self.feat_embed_dim),
                 nn.LayerNorm(self.feat_embed_dim),
                 nn.GELU(),
-                ResidualTransformer(self.feat_embed_dim, self.n_heads, self.dropout),
                 nn.Linear(self.feat_embed_dim, self.feat_embed_dim)
             )
             self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
-
-        self.modal_fusion = nn.ModuleList([
-            ResidualTransformer(self.feat_embed_dim, self.n_heads, self.dropout)
-            for _ in range(2)
+        
+        # Cross-modal attention
+        self.cross_attention = CrossModalAttention(self.feat_embed_dim)
+        
+        # Graph attention layers
+        self.gat_layers = nn.ModuleList([
+            GraphAttentionLayer(self.embedding_dim, self.embedding_dim, self.dropout)
+            for _ in range(self.n_layers)
         ])
         
-        self.online_encoder = nn.Sequential(
+        # Projection head for contrastive learning
+        self.projector = nn.Sequential(
             nn.Linear(self.embedding_dim, self.embedding_dim),
-            nn.BatchNorm1d(self.embedding_dim),
+            nn.LayerNorm(self.embedding_dim),
             nn.GELU(),
             nn.Linear(self.embedding_dim, self.embedding_dim)
         )
-        
-        self.target_encoder = copy.deepcopy(self.online_encoder)
-        for p in self.target_encoder.parameters():
-            p.requires_grad = False
-            
-        self.predictor = nn.Sequential(
-            nn.Linear(self.embedding_dim, self.embedding_dim),
-            nn.BatchNorm1d(self.embedding_dim),
-            nn.GELU(),
-            nn.Linear(self.embedding_dim, self.embedding_dim)
-        )
-        
-        self.tau = 0.996
-        self.register_buffer('queue', torch.randn(65536, self.embedding_dim))
-        self.queue = F.normalize(self.queue, dim=1)
-        self.register_buffer('queue_ptr', torch.zeros(1, dtype=torch.long))
         
         self.to(self.device)
 
-    @torch.no_grad()
-    def _momentum_update(self):
-        for online_params, target_params in zip(self.online_encoder.parameters(), self.target_encoder.parameters()):
-            target_params.data = target_params.data * self.tau + online_params.data * (1. - self.tau)
-            
-    @torch.no_grad()
-    def _dequeue_and_enqueue(self, keys):
-        batch_size = keys.shape[0]
-        ptr = int(self.queue_ptr)
-        if ptr + batch_size > len(self.queue):
-            batch_size = len(self.queue) - ptr
-            keys = keys[:batch_size]
-        self.queue[ptr:ptr + batch_size] = keys
-        ptr = (ptr + batch_size) % len(self.queue)
-        self.queue_ptr[0] = ptr
-
     def forward(self):
+        # Process modalities
         modal_feats = []
         if self.v_feat is not None:
             img_feat = self.image_encoder(self.image_embedding.weight)
@@ -134,30 +139,29 @@ class MMGAT(GeneralRecommender):
         if self.t_feat is not None:
             txt_feat = self.text_encoder(self.text_embedding.weight)
             modal_feats.append(txt_feat)
-            
-        if len(modal_feats) > 0:
-            if len(modal_feats) > 1:
-                modal_feats = torch.stack(modal_feats, dim=1)
-                for layer in self.modal_fusion:
-                    modal_feats = layer(modal_feats)
-                fused_features = modal_feats.mean(dim=1)
-            else:
-                fused_features = modal_feats[0]
+        
+        # Cross-modal fusion with attention
+        if len(modal_feats) > 1:
+            fused_features = self.cross_attention(modal_feats[0], modal_feats[1])
+        elif len(modal_feats) == 1:
+            fused_features = modal_feats[0]
         else:
             fused_features = self.item_embedding.weight
-
+        
+        # Graph attention with residual connections
         ego_embeddings = torch.cat([self.user_embedding.weight, self.item_embedding.weight])
         all_embeddings = [ego_embeddings]
         
-        for _ in range(self.n_layers):
-            ego_embeddings = torch.sparse.mm(self.norm_adj, ego_embeddings)
-            ego_embeddings = F.normalize(ego_embeddings, p=2, dim=1)
+        adj = self.norm_adj.to_dense()
+        for gat_layer in self.gat_layers:
+            ego_embeddings = gat_layer(ego_embeddings, adj) + ego_embeddings
             all_embeddings.append(ego_embeddings)
-            
+        
         all_embeddings = torch.stack(all_embeddings, dim=1)
         all_embeddings = torch.mean(all_embeddings, dim=1)
         u_g_embeddings, i_g_embeddings = torch.split(all_embeddings, [self.n_users, self.n_items])
         
+        # Enhance item embeddings with modal features
         i_g_embeddings = i_g_embeddings + fused_features
         
         return u_g_embeddings, i_g_embeddings
@@ -166,71 +170,48 @@ class MMGAT(GeneralRecommender):
         users = interaction[0]
         pos_items = interaction[1]
         neg_items = interaction[2]
-
-        self._momentum_update()
         
         u_embeddings, i_embeddings = self.forward()
         
-        u_online = self.online_encoder(u_embeddings)
-        i_online = self.online_encoder(i_embeddings)
+        # Project embeddings
+        u_embeddings = self.projector(u_embeddings)
+        i_embeddings = self.projector(i_embeddings)
         
+        u_e = u_embeddings[users]
+        pos_e = i_embeddings[pos_items]
+        neg_e = i_embeddings[neg_items]
+        
+        # InfoNCE loss
+        pos_scores = torch.sum(u_e * pos_e, dim=1) / self.temperature
+        neg_scores = torch.sum(u_e * neg_e, dim=1) / self.temperature
+        
+        loss_ce = -torch.mean(pos_scores - torch.logsumexp(torch.stack([pos_scores, neg_scores], dim=1), dim=1))
+        
+        # Hard negative mining
         with torch.no_grad():
-            u_target = self.target_encoder(u_embeddings)
-            i_target = self.target_encoder(i_embeddings)
+            neg_candidates = torch.matmul(u_e, i_embeddings.t())
+            neg_candidates[users.unsqueeze(1) == torch.arange(self.n_items).to(self.device)] = -1e10
+            _, hard_neg_items = neg_candidates.topk(10, dim=1)
+            hard_neg_e = i_embeddings[hard_neg_items]
         
-        u_pred = self.predictor(u_online)
-        i_pred = self.predictor(i_online)
+        hard_neg_scores = torch.sum(u_e.unsqueeze(1) * hard_neg_e, dim=2) / self.temperature
+        loss_hard = -torch.mean(pos_scores.unsqueeze(1) - torch.logsumexp(hard_neg_scores, dim=1))
         
-        u_feat = u_pred[users]
-        pos_feat = i_pred[pos_items]
-        neg_feat = i_pred[neg_items]
-        
-        u_target = u_target[users]
-        i_target = i_target[pos_items]
-        
-        pos_logits = torch.sum(u_feat * pos_feat, dim=1)
-        neg_logits = torch.sum(u_feat * neg_feat, dim=1)
-        
-        pos_loss = F.binary_cross_entropy_with_logits(
-            pos_logits,
-            torch.ones_like(pos_logits),
-            reduction='none'
-        )
-        neg_loss = F.binary_cross_entropy_with_logits(
-            neg_logits,
-            torch.zeros_like(neg_logits),
-            reduction='none'
-        )
-        
-        loss_ce = (pos_loss + neg_loss).mean()
-        
-        queue = self.queue.clone().detach()
-        u_contra = torch.einsum('nc,ck->nk', [F.normalize(u_feat, dim=1), queue.T])
-        i_contra = torch.einsum('nc,ck->nk', [F.normalize(pos_feat, dim=1), queue.T])
-        
-        contra_pos = torch.exp(torch.sum(F.normalize(u_feat, dim=1) * F.normalize(pos_feat, dim=1), dim=1) / self.temperature)
-        contra_neg_u = torch.sum(torch.exp(u_contra / self.temperature), dim=1)
-        contra_neg_i = torch.sum(torch.exp(i_contra / self.temperature), dim=1)
-        
-        loss_contra = -torch.log(contra_pos / (contra_neg_u + contra_neg_i + contra_pos)).mean()
-        
-        self._dequeue_and_enqueue(F.normalize(i_target.detach(), dim=1))
-        
+        # Regularization
         reg_loss = self.reg_weight * (
-            torch.norm(u_feat) / len(users) +
-            torch.norm(pos_feat) / len(pos_items) +
-            torch.norm(neg_feat) / len(neg_items)
+            torch.norm(u_e) / len(users) +
+            torch.norm(pos_e) / len(pos_items) +
+            torch.norm(neg_e) / len(neg_items)
         )
         
-        return loss_ce + loss_contra + reg_loss
+        return loss_ce + 0.1 * loss_hard + reg_loss
 
     def full_sort_predict(self, interaction):
         user = interaction[0]
         
         u_embeddings, i_embeddings = self.forward()
-        
-        u_embeddings = self.predictor(self.online_encoder(u_embeddings))
-        i_embeddings = self.predictor(self.online_encoder(i_embeddings))
+        u_embeddings = self.projector(u_embeddings)
+        i_embeddings = self.projector(i_embeddings)
         
         scores = torch.matmul(u_embeddings[user], i_embeddings.transpose(0, 1))
         return scores
