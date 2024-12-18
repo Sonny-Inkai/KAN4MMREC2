@@ -35,11 +35,15 @@ class MMGAT(GeneralRecommender):
         
         # Multi-modal feature processors
         if self.v_feat is not None:
+            # Move visual features to device before creating embedding
+            self.v_feat = self.v_feat.to(self.device)
             self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
             self.image_trs = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
             nn.init.xavier_normal_(self.image_trs.weight)
             
         if self.t_feat is not None:
+            # Move text features to device before creating embedding
+            self.t_feat = self.t_feat.to(self.device)
             self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
             self.text_trs = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
             nn.init.xavier_normal_(self.text_trs.weight)
@@ -63,6 +67,9 @@ class MMGAT(GeneralRecommender):
         self.predictor = nn.Linear(self.embedding_dim, self.embedding_dim)
         nn.init.xavier_normal_(self.predictor.weight)
 
+        # Move all components to device
+        self.to(self.device)
+
     def get_norm_adj_mat(self):
         A = sp.dok_matrix((self.n_users + self.n_items, self.n_users + self.n_items), dtype=np.float32)
         inter_M = self.interaction_matrix
@@ -82,7 +89,7 @@ class MMGAT(GeneralRecommender):
         col = L.col
         i = torch.LongTensor(np.array([row, col]))
         data = torch.FloatTensor(L.data)
-        return torch.sparse.FloatTensor(i, data, torch.Size((self.n_nodes, self.n_nodes)))
+        return torch.sparse_coo_tensor(i, data, torch.Size((self.n_nodes, self.n_nodes)))
 
     def get_knn_adj_mat(self, mm_embeddings):
         context_norm = mm_embeddings.div(torch.norm(mm_embeddings, p=2, dim=-1, keepdim=True))
@@ -99,13 +106,13 @@ class MMGAT(GeneralRecommender):
         return indices, self.compute_normalized_laplacian(indices, adj_size)
 
     def compute_normalized_laplacian(self, indices, adj_size):
-        adj = torch.sparse.FloatTensor(indices, torch.ones_like(indices[0]), adj_size)
+        adj = torch.sparse_coo_tensor(indices, torch.ones_like(indices[0]), adj_size)
         row_sum = 1e-7 + torch.sparse.sum(adj, -1).to_dense()
         r_inv_sqrt = torch.pow(row_sum, -0.5)
         rows_inv_sqrt = r_inv_sqrt[indices[0]]
         cols_inv_sqrt = r_inv_sqrt[indices[1]]
         values = rows_inv_sqrt * cols_inv_sqrt
-        return torch.sparse.FloatTensor(indices, values, adj_size)
+        return torch.sparse_coo_tensor(indices, values, adj_size)
 
     def forward(self):
         ego_embeddings = torch.cat((self.user_embedding.weight, self.item_id_embedding.weight), dim=0)
