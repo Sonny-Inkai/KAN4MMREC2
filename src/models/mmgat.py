@@ -14,18 +14,39 @@ class DynamicRoutingLayer(nn.Module):
         self.n_iter = n_iter
         self.scale = dim ** -0.5
         self.routing_weights = nn.Parameter(torch.randn(n_heads, dim, dim))
+        self.proj = nn.Linear(dim, dim)
         
     def forward(self, x):
-        B, N, D = x.shape
-        routing_logits = torch.zeros(B, self.n_heads, N, N, device=x.device)
+        # x shape: [N, num_modalities, D]
+        N, M, D = x.shape
         
+        # Initialize routing logits
+        routing_logits = torch.zeros(N, self.n_heads, M, M, device=x.device)
+        
+        # Iterative dynamic routing
         for _ in range(self.n_iter):
-            routing_weights = F.softmax(routing_logits, dim=-1)
+            # Softmax over modality dimension
+            routing_weights = F.softmax(routing_logits, dim=-1)  # [N, heads, M, M]
+            
+            # Transform features for each head
+            transformed_features = []
             for h in range(self.n_heads):
+                # Transform input: [N, M, D] -> [N, M, D]
                 x_transformed = torch.matmul(x, self.routing_weights[h])
-                routing_logits[:, h] = torch.matmul(x_transformed, x.transpose(-2, -1)) * self.scale
+                # Compute attention scores
+                scores = torch.matmul(x_transformed, x.transpose(-2, -1)) * self.scale
+                routing_logits[:, h] = scores
+            
+        # Final routing weights
+        final_weights = F.softmax(routing_logits.mean(dim=1), dim=-1)  # [N, M, M]
         
-        return torch.mean(torch.matmul(routing_weights, x), dim=1)
+        # Apply routing weights to features
+        out = torch.matmul(final_weights, x)  # [N, M, D]
+        
+        # Average over modalities
+        out = out.mean(dim=1)  # [N, D]
+        
+        return self.proj(out)
 
 class ModalityGatingUnit(nn.Module):
     def __init__(self, dim):
@@ -144,14 +165,18 @@ class MMGAT(GeneralRecommender):
             
         if len(modal_features) > 0:
             if len(modal_features) > 1:
-                # Dynamic routing between modalities
+                # Stack modalities: [N, num_modalities, D]
                 modal_features = torch.stack(modal_features, dim=1)
+                # Apply dynamic routing
                 fused_features = self.dynamic_routing(modal_features)
                 
-                # Adaptive gating between modalities
+                # Additional gating between modalities
                 v_gate = self.modality_gate(modal_features[:, 0], modal_features[:, 1])
                 t_gate = self.modality_gate(modal_features[:, 1], modal_features[:, 0])
-                fused_features = v_gate * modal_features[:, 0] + t_gate * modal_features[:, 1]
+                gated_features = v_gate * modal_features[:, 0] + t_gate * modal_features[:, 1]
+                
+                # Combine routed and gated features
+                fused_features = fused_features + gated_features.mean(dim=0)
             else:
                 fused_features = modal_features[0]
         else:
