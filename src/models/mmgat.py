@@ -25,14 +25,16 @@ class MMGAT(GeneralRecommender):
         # Number of nodes
         self.n_nodes = self.n_users + self.n_items
         
-        # Load interaction matrix
+        # Load interaction matrix and create normalized adjacency matrix
         self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
         self.norm_adj = self.get_norm_adj_mat().to(self.device)
+        
+        # Get edge information
         self.edge_indices, self.edge_values = self.get_edge_info()
         self.edge_indices = self.edge_indices.to(self.device)
         self.edge_values = self.edge_values.to(self.device)
         
-        # Embeddings
+        # Initialize embeddings
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
         self.item_id_embedding = nn.Embedding(self.n_items, self.embedding_dim)
         nn.init.xavier_uniform_(self.user_embedding.weight)
@@ -49,69 +51,69 @@ class MMGAT(GeneralRecommender):
             self.text_trs = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
             self.text_attention = MultiHeadAttention(self.feat_embed_dim, self.num_heads, self.dropout)
 
-        # Cross-modal fusion
-        self.modal_fusion = CrossModalFusion(self.feat_embed_dim)
-        
-        # Initialize adjacency matrices
+        # Initialize modal adjacency matrix
         self.mm_adj = None
         self.initialize_mm_adj()
 
     def get_norm_adj_mat(self):
-        A = sp.dok_matrix((self.n_users + self.n_items, self.n_users + self.n_items), dtype=np.float32)
+        """Create normalized adjacency matrix with proper handling of edge cases."""
+        A = sp.dok_matrix((self.n_nodes, self.n_nodes), dtype=np.float32)
         inter_M = self.interaction_matrix
         inter_M_t = self.interaction_matrix.transpose()
+        
+        # Create dictionary of interactions
         data_dict = dict(zip(zip(inter_M.row, inter_M.col + self.n_users), [1] * inter_M.nnz))
         data_dict.update(dict(zip(zip(inter_M_t.row + self.n_users, inter_M_t.col), [1] * inter_M_t.nnz)))
-        for key, value in data_dict.items():
-            A[key] = value
+        A._update(data_dict)
 
-        # Symmetric normalization
-        rowsum = np.array(A.sum(axis=1))
-        d_inv = np.power(rowsum, -0.5).flatten()
-        d_inv[np.isinf(d_inv)] = 0.
-        d_mat_inv = sp.diags(d_inv)
-        norm_adj = d_mat_inv.dot(A).dot(d_mat_inv)
+        # Add self-loops and normalize
+        A = A.tocoo().tocsr()
+        A = A + sp.eye(self.n_nodes)
+        degree = np.array(A.sum(axis=1)).squeeze()
+        degree = np.maximum(degree, np.finfo(float).eps)  # Avoid division by zero
+        d_inv_sqrt = np.power(degree, -0.5)
+        d_mat_inv_sqrt = sp.diags(d_inv_sqrt)
+        norm_adj = d_mat_inv_sqrt.dot(A).dot(d_mat_inv_sqrt)
         
         # Convert to torch sparse tensor
         norm_adj = norm_adj.tocoo()
-        indices = torch.LongTensor([norm_adj.row, norm_adj.col])
-        values = torch.FloatTensor(norm_adj.data)
+        indices = np.vstack((norm_adj.row, norm_adj.col))
+        indices = torch.from_numpy(indices).long()
+        values = torch.from_numpy(norm_adj.data).float()
         shape = torch.Size(norm_adj.shape)
         
-        return torch.sparse.FloatTensor(indices, values, shape)
+        return torch.sparse_coo_tensor(indices, values, shape)
 
     def get_edge_info(self):
-        rows = torch.from_numpy(self.interaction_matrix.row)
-        cols = torch.from_numpy(self.interaction_matrix.col)
+        """Get edge information with proper tensor types."""
+        rows = torch.from_numpy(self.interaction_matrix.row).long()
+        cols = torch.from_numpy(self.interaction_matrix.col).long()
         edges = torch.stack([rows, cols])
         values = self._normalize_adj_values(edges)
         return edges, values
 
     def _normalize_adj_values(self, edges):
-        """
-        Normalize adjacency matrix values using symmetric normalization
-        """
-        adj = torch.sparse.FloatTensor(
+        """Normalize adjacency values with proper handling of edge cases."""
+        values = torch.ones(edges.size(1), dtype=torch.float32)
+        adj = torch.sparse_coo_tensor(
             edges, 
-            torch.ones(edges.size(1)),
-            torch.Size([self.n_users, self.n_items])
+            values,
+            size=(self.n_users, self.n_items)
         )
         
-        # Add small epsilon to avoid division by zero
+        # Add epsilon for numerical stability
         epsilon = 1e-7
         
-        # Calculate row and column sums
-        row_sum = epsilon + torch.sparse.sum(adj, -1).to_dense()
-        col_sum = epsilon + torch.sparse.sum(adj.t(), -1).to_dense()
+        # Calculate degrees with safe handling of zero values
+        row_sum = epsilon + torch.sparse.sum(adj, dim=-1).to_dense()
+        col_sum = epsilon + torch.sparse.sum(adj.t(), dim=-1).to_dense()
         
-        # Calculate inverse square root of degrees
+        # Calculate normalized values
         r_inv_sqrt = torch.pow(row_sum, -0.5)
         c_inv_sqrt = torch.pow(col_sum, -0.5)
         
-        # Calculate normalized values
-        values = r_inv_sqrt[edges[0]] * c_inv_sqrt[edges[1]]
-        
-        return values
+        norm_values = r_inv_sqrt[edges[0]] * c_inv_sqrt[edges[1]]
+        return norm_values
 
     def initialize_mm_adj(self):
         if self.v_feat is not None:
