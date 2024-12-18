@@ -8,9 +8,9 @@ import numpy as np
 from common.abstract_recommender import GeneralRecommender
 from common.loss import BPRLoss, EmbLoss
 
-class EnhancedMMRec(GeneralRecommender):
+class MMGAT(GeneralRecommender):
     def __init__(self, config, dataset):
-        super(EnhancedMMRec, self).__init__(config, dataset)
+        super(MMGAT, self).__init__(config, dataset)
         
         self.embedding_dim = config['embedding_size']
         self.feat_embed_dim = config['feat_embed_dim']
@@ -18,7 +18,7 @@ class EnhancedMMRec(GeneralRecommender):
         self.mm_layers = config['n_mm_layers']
         self.dropout = config['dropout']
         self.reg_weight = config['reg_weight']
-        self.temp = config.get('temperature', 0.2)
+        self.temp = config['temperature']
         self.knn_k = config['knn_k']
         self.n_nodes = self.n_users + self.n_items
         
