@@ -4,6 +4,12 @@ import torch.nn.functional as F
 import scipy.sparse as sp
 import numpy as np
 import copy
+import torch.nn.functional as F
+from torch.nn.functional import cosine_similarity
+
+from common.abstract_recommender import GeneralRecommender
+from common.loss import EmbLoss
+
 
 class HierarchicalAttention(nn.Module):
     def __init__(self, dim, n_heads=8):
@@ -62,9 +68,9 @@ class ModalityFusion(nn.Module):
         x = self.norm2(x + self.mlp(x))
         return x
 
-class HERMES(GeneralRecommender):
+class MMGAT(GeneralRecommender):
     def __init__(self, config, dataset):
-        super(HERMES, self).__init__(config, dataset)
+        super(MMGAT, self).__init__(config, dataset)
         
         self.embedding_dim = config['embedding_size']
         self.feat_embed_dim = config['feat_embed_dim']
