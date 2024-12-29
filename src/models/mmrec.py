@@ -13,6 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
 from torch.nn.parameter import Parameter
+import math
 
 from common.abstract_recommender import GeneralRecommender
 from common.loss import BPRLoss, EmbLoss, L2Loss
@@ -229,13 +230,27 @@ class MultiHeadAttention(nn.Module):
         self.out = nn.Linear(dim_model, dim_model)
         
     def forward(self, q, k, v, mask=None):
+        # Add batch dimension if not present
+        if q.dim() == 2:
+            q = q.unsqueeze(0)
+            k = k.unsqueeze(0)
+            v = v.unsqueeze(0)
+            
         batch_size = q.size(0)
+        seq_len = q.size(1)
         
-        q = self.q_linear(q).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_linear(k).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_linear(v).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        # Linear transformations
+        q = self.q_linear(q)
+        k = self.k_linear(k)
+        v = self.v_linear(v)
         
-        scores = torch.matmul(q, k.transpose(-2, -1)) / torch.sqrt(torch.tensor(self.head_dim).float())
+        # Split into heads
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Scaled dot-product attention
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         
         if mask is not None:
             scores = scores.masked_fill(mask == 0, -1e9)
@@ -243,8 +258,15 @@ class MultiHeadAttention(nn.Module):
         attn = F.softmax(scores, dim=-1)
         context = torch.matmul(attn, v)
         
-        context = context.transpose(1, 2).contiguous().view(batch_size, -1, self.dim_model)
+        # Concatenate heads and put through final linear layer
+        context = context.transpose(1, 2).contiguous()
+        context = context.view(batch_size, seq_len, self.dim_model)
         output = self.out(context)
+        
+        # Remove batch dimension if it was added
+        if output.size(0) == 1:
+            output = output.squeeze(0)
+            
         return output
 
 
