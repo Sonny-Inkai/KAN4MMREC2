@@ -382,20 +382,40 @@ class ModalSpecificTransform(nn.Module):
 class ModalRouter(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        self.routing_weights = Parameter(torch.randn(2, dim))
-        self.routing_bias = Parameter(torch.zeros(dim))
-        self.temperature = 0.1
+        self.attention = nn.Sequential(
+            nn.Linear(dim, dim//4),
+            nn.ReLU(),
+            nn.Linear(dim//4, 1),
+            nn.Sigmoid()
+        )
+        self.transform = nn.Linear(dim, dim)
         
     def forward(self, modal_list):
-        modal_stack = torch.stack(modal_list, dim=1)  # [N, num_modalities, dim]
+        if len(modal_list) == 1:
+            return modal_list[0]
+            
+        # Transform each modality first
+        transformed_modals = [self.transform(modal) for modal in modal_list]
         
-        # Compute routing weights
-        routing_logits = torch.matmul(modal_stack, self.routing_weights.t())
-        routing_weights = F.softmax(routing_logits / self.temperature, dim=1)
+        # Stack modalities
+        modal_stack = torch.stack(transformed_modals, dim=0)  # [num_modalities, N, dim]
         
-        # Route and aggregate
-        routed_features = torch.sum(modal_stack * routing_weights.unsqueeze(-1), dim=1)
-        return routed_features + self.routing_bias
+        # Calculate attention weights for each modality
+        modal_weights = []
+        for modal in transformed_modals:
+            weight = self.attention(modal)  # [N, 1]
+            modal_weights.append(weight)
+            
+        # Stack weights and normalize
+        modal_weights = torch.stack(modal_weights, dim=1)  # [N, num_modalities, 1]
+        modal_weights = F.softmax(modal_weights, dim=1)
+        
+        # Transpose modal_stack to match weights dimension
+        modal_stack = modal_stack.permute(1, 0, 2)  # [N, num_modalities, dim]
+        
+        # Weight and sum modalities
+        fused = torch.sum(modal_stack * modal_weights, dim=1)  # [N, dim]
+        return fused
 
 
 class EdgeWeightAttention(nn.Module):
