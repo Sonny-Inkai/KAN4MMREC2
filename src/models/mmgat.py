@@ -7,7 +7,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATConv
 from common.abstract_recommender import GeneralRecommender
-from torch_geometric.utils import remove_self_loops, add_self_loops, degree
+from torch_geometric.utils import remove_self_loops, add_self_loops, degree, softmax
+from torch_scatter import scatter_add
 # 0.0260
 class ModalEncoder(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.2):
@@ -56,14 +57,26 @@ class EnhancedModalEncoder(nn.Module):
 class EnhancedGATLayer(nn.Module):
     def __init__(self, dim, heads=4, dropout=0.2):
         super().__init__()
-        self.gat = GATConv(dim, dim // heads, heads=heads, dropout=dropout)
+        self.gat = GATConv(dim, dim // heads, heads=heads, dropout=dropout, add_self_loops=True)
         self.norm = nn.LayerNorm(dim)
         self.dropout = nn.Dropout(dropout)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * 4, dim)
+        )
         
-    def forward(self, x, edge_index):
-        h = self.gat(x, edge_index)
+    def forward(self, x, edge_index, edge_weight=None):
+        # Multi-head attention
+        h = self.gat(x, edge_index, edge_weight)
         h = self.dropout(h)
         h = self.norm(h)
+        
+        # Feed-forward network
+        h2 = self.ffn(h)
+        h = h + h2  # Residual connection
+        h = self.norm(h)  # Final layer norm
         return h
 
 class ModalFusionLayer(nn.Module):
@@ -81,6 +94,12 @@ class ModalFusionLayer(nn.Module):
             nn.Linear(dim, dim),
             nn.Sigmoid()
         )
+        self.fusion_layer = nn.Sequential(
+            nn.Linear(dim * 2, dim),
+            nn.GELU(),
+            nn.LayerNorm(dim),
+            nn.Dropout(0.2)
+        )
         
     def forward(self, img_emb, txt_emb):
         # Compute attention weights
@@ -89,6 +108,10 @@ class ModalFusionLayer(nn.Module):
         
         # Weighted combination
         fused = weights[:, 0:1] * img_emb + weights[:, 1:2] * txt_emb
+        
+        # Additional fusion transformation
+        concat_features = torch.cat([img_emb, txt_emb], dim=1)
+        fused = fused + self.fusion_layer(concat_features)
         return fused
 
 class MMGAT(GeneralRecommender):
@@ -145,7 +168,7 @@ class MMGAT(GeneralRecommender):
         
         # Load and process interaction data
         self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
-        self.edge_index = self.build_edges()
+        self.edge_index, self.edge_weight = self.build_edges()
         self.mm_edge_index = None
         self.build_modal_graph()
         
@@ -165,7 +188,14 @@ class MMGAT(GeneralRecommender):
         edge_index, _ = remove_self_loops(edge_index)
         edge_index, _ = add_self_loops(edge_index, num_nodes=self.n_users + self.n_items)
         
-        return edge_index
+        # Calculate edge weights (degrees)
+        row, col = edge_index
+        deg = degree(row, self.n_users + self.n_items, dtype=torch.float)
+        deg_inv_sqrt = deg.pow(-0.5)
+        deg_inv_sqrt[deg_inv_sqrt == float('inf')] = 0
+        edge_weight = deg_inv_sqrt[row] * deg_inv_sqrt[col]
+        
+        return edge_index, edge_weight
 
     def build_modal_graph(self):
         if self.v_feat is None and self.t_feat is None:
@@ -176,11 +206,13 @@ class MMGAT(GeneralRecommender):
             v_feats = F.normalize(self.v_feat, p=2, dim=1)
             v_sim = torch.mm(v_feats, v_feats.t())
             v_values, v_indices = v_sim.topk(k=self.knn_k, dim=1)
+            del v_sim  # Free memory
             
         if self.t_feat is not None:
             t_feats = F.normalize(self.t_feat, p=2, dim=1)
             t_sim = torch.mm(t_feats, t_feats.t())
             t_values, t_indices = t_sim.topk(k=self.knn_k, dim=1)
+            del t_sim  # Free memory
         
         # Combine modalities with adaptive weighting
         if self.v_feat is not None and self.t_feat is not None:
@@ -191,16 +223,26 @@ class MMGAT(GeneralRecommender):
             v_weight = v_weight / total
             t_weight = t_weight / total
             
-            indices = v_weight * v_indices + t_weight * t_indices
+            indices = torch.round(v_weight * v_indices.float() + t_weight * t_indices.float()).long()
         else:
             indices = v_indices if self.v_feat is not None else t_indices
             
         rows = torch.arange(indices.size(0), device=self.device).view(-1, 1).expand_as(indices)
         
-        self.mm_edge_index = torch.stack([
+        edge_index = torch.stack([
             torch.cat([rows.reshape(-1), indices.reshape(-1)]),
             torch.cat([indices.reshape(-1), rows.reshape(-1)])
         ]).to(self.device)
+        
+        # Calculate edge weights for modal graph
+        row, col = edge_index
+        deg = degree(row, indices.size(0), dtype=torch.float)
+        deg_inv_sqrt = deg.pow(-0.5)
+        deg_inv_sqrt[deg_inv_sqrt == float('inf')] = 0
+        edge_weight = deg_inv_sqrt[row] * deg_inv_sqrt[col]
+        
+        self.mm_edge_index = edge_index
+        self.mm_edge_weight = edge_weight
 
     def forward(self):
         # Enhanced forward pass with residual connections and layer normalization
@@ -222,7 +264,7 @@ class MMGAT(GeneralRecommender):
         if modal_emb is not None:
             h = modal_emb
             for layer in self.mm_layers:
-                h_new = layer(h, self.mm_edge_index)
+                h_new = layer(h, self.mm_edge_index, self.mm_edge_weight)
                 h = h + h_new  # Residual connection
                 h = F.layer_norm(h, h.size()[1:])
             modal_emb = h
@@ -234,7 +276,7 @@ class MMGAT(GeneralRecommender):
         for layer in self.ui_layers:
             if self.training:
                 x = F.dropout(x, p=self.dropout)
-            x_new = layer(x, self.edge_index)
+            x_new = layer(x, self.edge_index, self.edge_weight)
             x = x + x_new  # Residual connection
             x = F.layer_norm(x, x.size()[1:])
             all_embs.append(x)
@@ -260,26 +302,44 @@ class MMGAT(GeneralRecommender):
         pos_emb = item_emb[pos_items]
         neg_emb = item_emb[neg_items]
         
-        # BPR loss
-        pos_scores = torch.sum(u_emb * pos_emb, dim=1)
-        neg_scores = torch.sum(u_emb * neg_emb, dim=1)
+        # BPR loss with temperature scaling
+        temperature = 0.2
+        pos_scores = torch.sum(u_emb * pos_emb, dim=1) / temperature
+        neg_scores = torch.sum(u_emb * neg_emb, dim=1) / temperature
         mf_loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
         
-        # Modal contrastive loss
+        # Enhanced modal contrastive loss
         modal_loss = 0.0
         if img_emb is not None and txt_emb is not None:
-            pos_sim = F.cosine_similarity(img_emb[pos_items], txt_emb[pos_items])
-            neg_sim = F.cosine_similarity(img_emb[pos_items], txt_emb[neg_items])
-            modal_loss = -torch.mean(F.logsigmoid(pos_sim - neg_sim))
+            # Intra-modal contrastive loss
+            pos_sim_img = F.cosine_similarity(img_emb[pos_items], img_emb[pos_items])
+            neg_sim_img = F.cosine_similarity(img_emb[pos_items], img_emb[neg_items])
+            img_loss = -torch.mean(F.logsigmoid(pos_sim_img - neg_sim_img))
+            
+            pos_sim_txt = F.cosine_similarity(txt_emb[pos_items], txt_emb[pos_items])
+            neg_sim_txt = F.cosine_similarity(txt_emb[pos_items], txt_emb[neg_items])
+            txt_loss = -torch.mean(F.logsigmoid(pos_sim_txt - neg_sim_txt))
+            
+            # Cross-modal contrastive loss
+            pos_sim_cross = F.cosine_similarity(img_emb[pos_items], txt_emb[pos_items])
+            neg_sim_cross = F.cosine_similarity(img_emb[pos_items], txt_emb[neg_items])
+            cross_loss = -torch.mean(F.logsigmoid(pos_sim_cross - neg_sim_cross))
+            
+            modal_loss = img_loss + txt_loss + cross_loss
         
-        # Regularization loss
+        # L2 regularization with weight decay
         reg_loss = self.reg_weight * (
             torch.norm(u_emb) +
             torch.norm(pos_emb) +
-            torch.norm(neg_emb)
+            torch.norm(neg_emb) +
+            (torch.norm(img_emb) + torch.norm(txt_emb) if img_emb is not None and txt_emb is not None else 0)
         )
         
-        return mf_loss + 0.1 * modal_loss + reg_loss
+        # Adaptive loss weighting
+        modal_weight = self.lambda_coeff * torch.sigmoid(modal_loss.detach())
+        total_loss = mf_loss + modal_weight * modal_loss + reg_loss
+        
+        return total_loss
 
     def full_sort_predict(self, interaction):
         user = interaction[0]
