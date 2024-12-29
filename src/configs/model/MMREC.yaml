@@ -1,0 +1,7 @@
+embedding_size: 64              # (int) the embedding size of users and items
+feat_embed_dim: 64              # (int) the embedding size of multimodal features
+n_layers: 3                     # (int) the number of GNN layers
+n_heads: 4                      # (int) the number of attention heads
+reg_weight: 1e-5                # (float) the weight decay for l2 normalizaton
+dropout: 0.3                    # (float) the dropout rate
+modality_agg: "weighted"        # (str) the modality aggregation method, can be "concat" or "weighted" 
