@@ -193,15 +193,18 @@ class GATLayer(nn.Module):
 
         self.W = nn.Parameter(torch.zeros(size=(in_dim, out_dim)))
         nn.init.xavier_uniform_(self.W.data, gain=1.414)
-        self.a = nn.Parameter(torch.zeros(size=(2*out_dim, 1)))
-        nn.init.xavier_uniform_(self.a.data, gain=1.414)
+        self.a_src = nn.Parameter(torch.zeros(size=(1, out_dim)))
+        self.a_dst = nn.Parameter(torch.zeros(size=(1, out_dim)))
+        nn.init.xavier_uniform_(self.a_src.data, gain=1.414)
+        nn.init.xavier_uniform_(self.a_dst.data, gain=1.414)
         self.leakyrelu = nn.LeakyReLU(self.alpha)
 
     def forward(self, x, adj):
         h = torch.mm(x, self.W)
         N = h.size()[0]
-        a_input = torch.cat([h.repeat(1, N).view(N * N, -1), h.repeat(N, 1)], dim=1).view(N, -1, 2 * self.out_dim)
-        e = self.leakyrelu(torch.matmul(a_input, self.a).squeeze(2))
+        e_src = h @ self.a_src.t()
+        e_dst = h @ self.a_dst.t()
+        e = self.leakyrelu(e_src.expand(-1, N) + e_dst.expand(N, -1).t())
 
         zero_vec = -9e15*torch.ones_like(e)
         attention = torch.where(adj > 0, e, zero_vec)
