@@ -101,8 +101,10 @@ class MMREC(GeneralRecommender):
 
         if self.v_feat_embedding is not None:
             v_feat = self.v_feat_trs(self.v_feat_embedding.weight)
+            v_feat = torch.cat((torch.zeros(self.n_users, self.feat_embed_dim).to(self.device), v_feat), dim=0)
         if self.t_feat_embedding is not None:  
             t_feat = self.t_feat_trs(self.t_feat_embedding.weight)
+            t_feat = torch.cat((torch.zeros(self.n_users, self.feat_embed_dim).to(self.device), t_feat), dim=0)
 
         all_embeddings = [ego_embeddings]
         
@@ -116,14 +118,11 @@ class MMREC(GeneralRecommender):
                     ego_embeddings = torch.cat((ego_embeddings, t_feat), dim=1)
             elif self.modality_agg == "weighted":
                 if self.v_feat_embedding is not None and self.t_feat_embedding is not None:
-                    ego_embeddings = torch.cat((ego_embeddings, (v_feat + t_feat)/2), dim=1)
-                    ego_embeddings = self.modal_aggregator[0] * ego_embeddings[:, :self.embedding_dim] + self.modal_aggregator[1] * ego_embeddings[:, self.embedding_dim:]
+                    ego_embeddings = self.modal_aggregator[0] * ego_embeddings + self.modal_aggregator[1] * (v_feat + t_feat)/2
                 elif self.v_feat_embedding is not None:
-                    ego_embeddings = torch.cat((ego_embeddings, v_feat), dim=1)
-                    ego_embeddings = self.modal_aggregator[0] * ego_embeddings[:, :self.embedding_dim] + self.modal_aggregator[1] * ego_embeddings[:, self.embedding_dim:]
+                    ego_embeddings = self.modal_aggregator[0] * ego_embeddings + self.modal_aggregator[1] * v_feat
                 elif self.t_feat_embedding is not None:
-                    ego_embeddings = torch.cat((ego_embeddings, t_feat), dim=1)
-                    ego_embeddings = self.modal_aggregator[0] * ego_embeddings[:, :self.embedding_dim] + self.modal_aggregator[1] * ego_embeddings[:, self.embedding_dim:]
+                    ego_embeddings = self.modal_aggregator[0] * ego_embeddings + self.modal_aggregator[1] * t_feat
             
             ego_embeddings = gnn_layer(ego_embeddings, self.norm_adj)
             all_embeddings += [ego_embeddings]
