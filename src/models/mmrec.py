@@ -70,9 +70,9 @@ class MMREC(GeneralRecommender):
         self.modal_fusion = ModalFusion(self.feat_embed_dim)
 
         # Add new components
-        self.modal_specific = config.get("modal_specific", True)
-        self.fusion_layer = config.get("fusion_layer", "early")  # early, late, hybrid
-        self.use_modal_routing = config.get("use_modal_routing", True)
+        self.modal_specific = config["modal_specific"] if "modal_specific" in config else True
+        self.fusion_layer = config["fusion_layer"] if "fusion_layer" in config else "early"  # early, late, hybrid
+        self.use_modal_routing = config["use_modal_routing"] if "use_modal_routing" in config else True
         
         if self.modal_specific:
             self.modal_transform = ModalSpecificTransform(self.feat_embed_dim)
@@ -248,6 +248,14 @@ class MMGNNLayer(nn.Module):
         super().__init__()
         self.dropout = dropout
         self.n_heads = n_heads
+        
+        # For hybrid fusion, input dim will be larger
+        self.input_dim = embedding_dim * 2 if self.fusion_layer == "hybrid" else embedding_dim
+        self.output_dim = embedding_dim
+        
+        # Project input to correct dimension if needed
+        self.input_proj = nn.Linear(self.input_dim, embedding_dim) if self.input_dim != embedding_dim else nn.Identity()
+        
         self.attentions = nn.ModuleList([
             GATLayer(embedding_dim, embedding_dim//n_heads, dropout=dropout)
             for _ in range(n_heads)
@@ -255,6 +263,8 @@ class MMGNNLayer(nn.Module):
         self.edge_weight_attention = EdgeWeightAttention(embedding_dim)
         
     def forward(self, x, adj):
+        # Project input if dimensions don't match
+        x = self.input_proj(x)
         x = F.dropout(x, self.dropout, training=self.training)
         
         # Apply edge weight attention

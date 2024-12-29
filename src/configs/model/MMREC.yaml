@@ -4,4 +4,7 @@ n_layers: 3                     # (int) the number of GNN layers
 n_heads: 4                      # (int) the number of attention heads
 reg_weight: 1e-5                # (float) the weight decay for l2 normalizaton
 dropout: 0.3                    # (float) the dropout rate
-modality_agg: "weighted"        # (str) the modality aggregation method, can be "concat" or "weighted" 
+modality_agg: "weighted"        # (str) the modality aggregation method, can be "concat" or "weighted"
+modal_specific: true            # (bool) whether to use modal-specific transformations
+fusion_layer: "early"           # (str) fusion strategy: "early", "late", or "hybrid"
+use_modal_routing: true         # (bool) whether to use modal routing mechanism 
