@@ -31,6 +31,11 @@ class MMREC(GeneralRecommender):
         self.dropout = config["dropout"]
         self.modality_agg = config["modality_agg"]
 
+        # Move these initializations up before they're used
+        self.modal_specific = config["modal_specific"] if "modal_specific" in config else True
+        self.fusion_layer = config["fusion_layer"] if "fusion_layer" in config else "early"  # early, late, hybrid
+        self.use_modal_routing = config["use_modal_routing"] if "use_modal_routing" in config else True
+
         self.n_nodes = self.n_users + self.n_items
         
         # Load dataset info
@@ -63,17 +68,17 @@ class MMREC(GeneralRecommender):
         # GNN layers
         self.gnn_layers = nn.ModuleList()
         for _ in range(self.n_layers):
-            self.gnn_layers.append(MMGNNLayer(self.embedding_dim, self.n_heads, self.dropout))
+            self.gnn_layers.append(MMGNNLayer(
+                embedding_dim=self.embedding_dim, 
+                n_heads=self.n_heads, 
+                dropout=self.dropout,
+                fusion_layer=self.fusion_layer
+            ))
 
         # Cross-modal contrastive learning
         self.temperature = 0.2
         self.modal_fusion = ModalFusion(self.feat_embed_dim)
 
-        # Add new components
-        self.modal_specific = config["modal_specific"] if "modal_specific" in config else True
-        self.fusion_layer = config["fusion_layer"] if "fusion_layer" in config else "early"  # early, late, hybrid
-        self.use_modal_routing = config["use_modal_routing"] if "use_modal_routing" in config else True
-        
         if self.modal_specific:
             self.modal_transform = ModalSpecificTransform(self.feat_embed_dim)
         
@@ -244,13 +249,13 @@ class MultiHeadAttention(nn.Module):
 
 
 class MMGNNLayer(nn.Module):
-    def __init__(self, embedding_dim, n_heads, dropout):
+    def __init__(self, embedding_dim, n_heads, dropout, fusion_layer):
         super().__init__()
         self.dropout = dropout
         self.n_heads = n_heads
         
         # For hybrid fusion, input dim will be larger
-        self.input_dim = embedding_dim * 2 if self.fusion_layer == "hybrid" else embedding_dim
+        self.input_dim = embedding_dim * 2 if fusion_layer == "hybrid" else embedding_dim
         self.output_dim = embedding_dim
         
         # Project input to correct dimension if needed
