@@ -1,38 +1,35 @@
-# Hyperparameter configuration for MMRecModel
+# Enhanced hyperparameter configuration for MMGAT
 
 embedding_size: 64
 feat_embed_dim: 64
 
-# Number of layers for multimodal and user-item interactions
-n_layers: 2
+# Increased number of layers for better representation
+n_layers: 3
 
-# Dropout rates to prevent overfitting
-dropout: [0.1, 0.3, 0.5]
+# Optimized dropout rates
+dropout: [0.1, 0.2, 0.3]
 
-# Regularization weights for different components
-reg_weight: [1e-5, 1e-4, 1e-3]
+# Refined regularization weights
+reg_weight: [1e-5, 5e-5, 1e-4]
 
-# Coefficient for multimodal weight
-mm_image_weight: 0.1
-
-# Coefficient for collaborative filtering loss
-lambda_coeff: 0.9
-
-# Number of user-item interaction layers
-n_ui_layers: 2
-
-# Degree ratio for normalization
-degree_ratio: 0.8
-
-# Additional hyperparameters
-knn_k: 10
-
-n_mm_layers: 2
-cl_weight: 0.1
-mm_image_weight: 0.1
-temperature: 0.07
-ssl_weight: 0.1
+# Increased number of attention heads
 n_heads: 8
-num_clusters: 10
+
+# Temperature parameter for InfoNCE loss
+temperature: 0.07
+
+# Modal fusion parameters
+modal_fusion_layers: 2
+modal_dropout: 0.1
+
+# Graph attention parameters
+gat_dropout: 0.1
+gat_heads: 8
+gat_concat: True
+
+# Training parameters
+learning_rate: 0.001
+weight_decay: 0.0001
+batch_size: 1024
 
 hyper_parameters: ["dropout", "reg_weight"]

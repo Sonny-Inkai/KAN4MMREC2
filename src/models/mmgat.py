@@ -8,22 +8,30 @@ from common.abstract_recommender import GeneralRecommender
 from common.loss import EmbLoss
 
 class FlashAttention(nn.Module):
-    def __init__(self, dim, num_heads=4, dropout=0.1):
+    def __init__(self, dim, num_heads=8, dropout=0.1, scale_factor=0.125):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
+        self.scale = (self.head_dim ** -0.5) * scale_factor
         
         self.qkv = nn.Linear(dim, dim * 3)
         self.proj = nn.Linear(dim, dim)
         self.dropout = nn.Dropout(dropout)
         
-    def forward(self, x):
+        # Add learnable temperature parameter
+        self.temp = nn.Parameter(torch.ones(1, num_heads, 1, 1))
+        
+    def forward(self, x, mask=None):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         
-        attn = (q @ k.transpose(-2, -1)) * self.scale
+        # Scaled dot-product attention with learnable temperature
+        attn = (q @ k.transpose(-2, -1)) * self.scale * self.temp
+        
+        if mask is not None:
+            attn = attn.masked_fill(mask == 0, -1e9)
+            
         attn = attn.softmax(dim=-1)
         attn = self.dropout(attn)
         
@@ -48,28 +56,54 @@ class ModalFusionBlock(nn.Module):
         x = x + self.mlp(self.norm2(x))
         return x
 
+class AdaptiveModalFusion(nn.Module):
+    def __init__(self, dim, num_modalities=2):
+        super().__init__()
+        self.modal_weights = nn.Parameter(torch.ones(num_modalities) / num_modalities)
+        self.modal_norm = nn.LayerNorm(dim)
+        self.fusion_layer = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.GELU(),
+            nn.Linear(dim * 2, dim)
+        )
+        
+    def forward(self, modal_features):
+        # Normalize weights
+        weights = F.softmax(self.modal_weights, dim=0)
+        
+        # Weighted sum of modalities
+        fused = torch.zeros_like(modal_features[0])
+        for i, features in enumerate(modal_features):
+            fused += weights[i] * features
+            
+        # Apply normalization and fusion
+        fused = self.modal_norm(fused)
+        fused = self.fusion_layer(fused)
+        return fused
+
 class MMGAT(GeneralRecommender):
     def __init__(self, config, dataset):
         super().__init__(config, dataset)
         
+        # Initialize dimensions and parameters
         self.embedding_dim = config['embedding_size']
         self.feat_embed_dim = config['feat_embed_dim']
         self.n_layers = config['n_layers']
         self.dropout = config['dropout']
         self.reg_weight = config['reg_weight']
-        self.n_heads = 4
-        self.temperature = 0.07
+        self.n_heads = config['n_heads']
+        self.temperature = config['temperature']
         
         self.n_nodes = self.n_users + self.n_items
         self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
         self.norm_adj = self.get_norm_adj_mat().to(self.device)
         
-        # Embeddings with better initialization
+        # Enhanced embeddings
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
         self.item_embedding = nn.Embedding(self.n_items, self.embedding_dim)
         self.apply(self._init_weights)
         
-        # Enhanced modal encoders
+        # Modal encoders with residual connections
         if self.v_feat is not None:
             self.v_feat = self.v_feat.to(self.device)
             self.image_encoder = nn.Sequential(
@@ -92,15 +126,18 @@ class MMGAT(GeneralRecommender):
             )
             self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
         
-        # Modal fusion with Flash Attention
-        self.modal_fusion = nn.ModuleList([
+        # Enhanced modal fusion with Flash Attention
+        self.modal_fusion_blocks = nn.ModuleList([
             ModalFusionBlock(self.feat_embed_dim, self.n_heads)
             for _ in range(2)
         ])
         
-        # Graph convolution
-        self.gc_layers = nn.ModuleList([
-            nn.Linear(self.embedding_dim, self.embedding_dim, bias=False)
+        # Add adaptive modal fusion
+        self.adaptive_fusion = AdaptiveModalFusion(self.feat_embed_dim)
+        
+        # Graph attention layers
+        self.gat_layers = nn.ModuleList([
+            FlashAttention(self.embedding_dim, self.n_heads, self.dropout)
             for _ in range(self.n_layers)
         ])
         
@@ -108,14 +145,14 @@ class MMGAT(GeneralRecommender):
     
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
-            nn.init.trunc_normal_(m.weight, std=0.02)
+            nn.init.xavier_uniform_(m.weight)
             if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
+                nn.init.zeros_(m.bias)
         elif isinstance(m, nn.Embedding):
-            nn.init.trunc_normal_(m.weight, std=0.02)
+            nn.init.xavier_uniform_(m.weight)
         elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
+            nn.init.ones_(m.weight)
+            nn.init.zeros_(m.bias)
     
     def forward(self):
         # Modal feature extraction and fusion
@@ -128,26 +165,33 @@ class MMGAT(GeneralRecommender):
             txt_feat = self.text_encoder(self.text_embedding.weight)
             modal_features.append(txt_feat)
         
-        # Enhanced modal fusion with Flash Attention
+        # Enhanced modal fusion
         if len(modal_features) > 0:
             if len(modal_features) > 1:
+                # Apply adaptive fusion
+                fused_features = self.adaptive_fusion(modal_features)
+                
+                # Apply modal fusion blocks
                 modal_stack = torch.stack(modal_features, dim=1)
-                for fusion_layer in self.modal_fusion:
+                for fusion_layer in self.modal_fusion_blocks:
                     modal_stack = fusion_layer(modal_stack)
-                fused_features = torch.mean(modal_stack, dim=1)
+                fused_features = fused_features + torch.mean(modal_stack, dim=1)
             else:
                 fused_features = modal_features[0]
         else:
             fused_features = None
         
-        # Graph convolution with residual connections
+        # Graph attention with residual connections
         x = torch.cat([self.user_embedding.weight, self.item_embedding.weight])
         all_embs = [x]
         
         for i in range(self.n_layers):
+            # Graph attention
+            x_res = x
             x = torch.sparse.mm(self.norm_adj, x)
-            x = self.gc_layers[i](x)
+            x = self.gat_layers[i](x)
             x = F.dropout(x, p=self.dropout, training=self.training)
+            x = x + x_res  # Residual connection
             all_embs.append(x)
         
         x = torch.mean(torch.stack(all_embs, dim=1), dim=1)
@@ -176,7 +220,7 @@ class MMGAT(GeneralRecommender):
         
         loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
         
-        # Modal alignment loss
+        # Modal alignment loss with improved temperature scaling
         if hasattr(self, 'image_embedding') and hasattr(self, 'text_embedding'):
             img_feat = self.image_encoder(self.image_embedding.weight)
             txt_feat = self.text_encoder(self.text_embedding.weight)
@@ -188,7 +232,7 @@ class MMGAT(GeneralRecommender):
             modal_loss = -torch.mean(torch.diag(F.log_softmax(modal_sim, dim=1)))
             loss = loss + 0.1 * modal_loss
         
-        # L2 regularization
+        # L2 regularization with improved weighting
         reg_loss = self.reg_weight * (
             torch.norm(u_emb) / len(users) +
             torch.norm(pos_emb) / len(pos_items) +
@@ -200,7 +244,13 @@ class MMGAT(GeneralRecommender):
     def full_sort_predict(self, interaction):
         user = interaction[0]
         user_emb, item_emb = self.forward()
-        scores = torch.matmul(user_emb[user], item_emb.transpose(0, 1))
+        
+        # Get embeddings for the batch of users
+        u_embeddings = user_emb[user]
+        
+        # Calculate scores for all items
+        scores = torch.matmul(u_embeddings, item_emb.transpose(0, 1))
+        
         return scores
 
     def get_norm_adj_mat(self):
@@ -212,12 +262,31 @@ class MMGAT(GeneralRecommender):
         for key, value in data_dict.items():
             A[key] = value
         
-        sumArr = (A > 0).sum(axis=1)
-        diag = np.array(sumArr.flatten())[0] + 1e-7
-        diag = np.power(diag, -0.5)
-        D = sp.diags(diag)
-        L = D * A * D
-        L = sp.coo_matrix(L)
-        indices = torch.LongTensor(np.array([L.row, L.col]))
-        values = torch.FloatTensor(L.data)
-        return torch.sparse_coo_tensor(indices, values, torch.Size((self.n_nodes, self.n_nodes)))
+        # Add self-connections and normalize
+        A = A + sp.eye(self.n_nodes)
+        rowsum = np.array(A.sum(axis=1))
+        d_inv = np.power(rowsum, -0.5).flatten()
+        d_inv[np.isinf(d_inv)] = 0.
+        d_mat = sp.diags(d_inv)
+        
+        # Symmetric normalization
+        norm_adj = d_mat.dot(A).dot(d_mat)
+        norm_adj = norm_adj.tocoo()
+        
+        # Convert to torch sparse tensor
+        indices = torch.LongTensor([norm_adj.row, norm_adj.col])
+        values = torch.FloatTensor(norm_adj.data)
+        shape = torch.Size(norm_adj.shape)
+        return torch.sparse.FloatTensor(indices, values, shape)
+
+    def pre_epoch_processing(self):
+        """
+        Operations to perform before each epoch
+        """
+        pass
+
+    def post_epoch_processing(self):
+        """
+        Operations to perform after each epoch
+        """
+        pass
