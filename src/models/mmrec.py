@@ -11,6 +11,8 @@ import scipy.sparse as sp
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.nn.init as init
+from torch.nn.parameter import Parameter
 
 from common.abstract_recommender import GeneralRecommender
 from common.loss import BPRLoss, EmbLoss, L2Loss
@@ -30,109 +32,137 @@ class MMREC(GeneralRecommender):
         self.modality_agg = config["modality_agg"]
 
         self.n_nodes = self.n_users + self.n_items
-
-        # load dataset info
+        
+        # Load dataset info
         self.interaction_matrix = dataset.inter_matrix(form="coo").astype(np.float32)
         self.norm_adj = self.get_norm_adj_mat().to(self.device)
 
+        # Initialize embeddings
         self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
         self.item_id_embedding = nn.Embedding(self.n_items, self.embedding_dim)
         nn.init.xavier_uniform_(self.user_embedding.weight)
         nn.init.xavier_uniform_(self.item_id_embedding.weight)
 
+        # Initialize feature embeddings and transformations
         self.v_feat_embedding = None
+        self.t_feat_embedding = None
         if self.v_feat is not None:
-            self.v_feat_embedding = nn.Embedding.from_pretrained(
-                self.v_feat, freeze=False
-            )
+            self.v_feat_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
             self.v_feat_trs = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
-
-        self.t_feat_embedding = None  
+            self.v_attn = MultiHeadAttention(self.feat_embed_dim, self.n_heads)
+            
         if self.t_feat is not None:
-            self.t_feat_embedding = nn.Embedding.from_pretrained(
-                self.t_feat, freeze=False
-            )
+            self.t_feat_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
             self.t_feat_trs = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
+            self.t_attn = MultiHeadAttention(self.feat_embed_dim, self.n_heads)
 
-        self.modal_aggregator = nn.Parameter(torch.ones(2)/2)
-
+        # Modality fusion
+        if self.modality_agg == "weighted":
+            self.modal_weights = nn.Parameter(torch.ones(2)/2)
+        
+        # GNN layers
         self.gnn_layers = nn.ModuleList()
-        for i in range(self.n_layers):
+        for _ in range(self.n_layers):
             self.gnn_layers.append(MMGNNLayer(self.embedding_dim, self.n_heads, self.dropout))
 
+        # Cross-modal contrastive learning
+        self.temperature = 0.2
+        self.modal_fusion = ModalFusion(self.feat_embed_dim)
+
+        # Add new components
+        self.modal_specific = config.get("modal_specific", True)
+        self.fusion_layer = config.get("fusion_layer", "early")  # early, late, hybrid
+        self.use_modal_routing = config.get("use_modal_routing", True)
+        
+        if self.modal_specific:
+            self.modal_transform = ModalSpecificTransform(self.feat_embed_dim)
+        
+        if self.use_modal_routing:
+            self.modal_router = ModalRouter(self.feat_embed_dim)
+
+        # Add residual connections
+        self.use_residual = True
+        self.layer_norms = nn.ModuleList([
+            nn.LayerNorm(self.embedding_dim) 
+            for _ in range(self.n_layers)
+        ])
+
     def get_norm_adj_mat(self):
-        A = sp.dok_matrix(
-            (self.n_users + self.n_items, self.n_users + self.n_items), dtype=np.float32
-        )
+        A = sp.dok_matrix((self.n_users + self.n_items, self.n_users + self.n_items), dtype=np.float32)
         inter_M = self.interaction_matrix
         inter_M_t = self.interaction_matrix.transpose()
-        data_dict = dict(
-            zip(zip(inter_M.row, inter_M.col + self.n_users), [1] * inter_M.nnz)
-        )
-        data_dict.update(
-            dict(
-                zip(
-                    zip(inter_M_t.row + self.n_users, inter_M_t.col),
-                    [1] * inter_M_t.nnz,
-                )
-            )
-        )
+        data_dict = dict(zip(zip(inter_M.row, inter_M.col + self.n_users), [1] * inter_M.nnz))
+        data_dict.update(dict(zip(zip(inter_M_t.row + self.n_users, inter_M_t.col), [1] * inter_M_t.nnz)))
         for key, value in data_dict.items():
             A[key] = value
-        # norm adj matrix
+        
         sumArr = (A > 0).sum(axis=1)
         diag = np.array(sumArr.flatten())[0] + 1e-7
         diag = np.power(diag, -0.5)
         D = sp.diags(diag)
         L = D * A * D
-        # covert norm_adj matrix to tensor
         L = sp.coo_matrix(L)
         row = L.row
         col = L.col
         i = torch.LongTensor(np.array([row, col]))
         data = torch.FloatTensor(L.data)
-        SparseL = torch.sparse.FloatTensor(i, data, torch.Size(L.shape))
+        SparseL = torch.sparse_coo_tensor(i, data, torch.Size(L.shape))
         return SparseL
-    
-    def forward(self):
-        ego_embeddings = torch.cat(
-            (self.user_embedding.weight, self.item_id_embedding.weight), dim=0
-        )
 
+    def forward(self):
+        ego_embeddings = torch.cat((self.user_embedding.weight, self.item_id_embedding.weight), dim=0)
+        
+        # Process modalities with routing
+        modal_embeddings = []
         if self.v_feat_embedding is not None:
             v_feat = self.v_feat_trs(self.v_feat_embedding.weight)
+            if self.modal_specific:
+                v_feat = self.modal_transform(v_feat, 'visual')
+            v_feat = self.v_attn(v_feat, v_feat, v_feat)
             v_feat = torch.cat((torch.zeros(self.n_users, self.feat_embed_dim).to(self.device), v_feat), dim=0)
-        if self.t_feat_embedding is not None:  
-            t_feat = self.t_feat_trs(self.t_feat_embedding.weight)
-            t_feat = torch.cat((torch.zeros(self.n_users, self.feat_embed_dim).to(self.device), t_feat), dim=0)
-
-        all_embeddings = [ego_embeddings]
-        
-        for i, gnn_layer in enumerate(self.gnn_layers):
-            if self.modality_agg == "concat":
-                if self.v_feat_embedding is not None and self.t_feat_embedding is not None:
-                    ego_embeddings = torch.cat((ego_embeddings, v_feat, t_feat), dim=1)
-                elif self.v_feat_embedding is not None:
-                    ego_embeddings = torch.cat((ego_embeddings, v_feat), dim=1)  
-                elif self.t_feat_embedding is not None:
-                    ego_embeddings = torch.cat((ego_embeddings, t_feat), dim=1)
-            elif self.modality_agg == "weighted":
-                if self.v_feat_embedding is not None and self.t_feat_embedding is not None:
-                    ego_embeddings = self.modal_aggregator[0] * ego_embeddings + self.modal_aggregator[1] * (v_feat + t_feat)/2
-                elif self.v_feat_embedding is not None:
-                    ego_embeddings = self.modal_aggregator[0] * ego_embeddings + self.modal_aggregator[1] * v_feat
-                elif self.t_feat_embedding is not None:
-                    ego_embeddings = self.modal_aggregator[0] * ego_embeddings + self.modal_aggregator[1] * t_feat
+            modal_embeddings.append(v_feat)
             
-            ego_embeddings = gnn_layer(ego_embeddings, self.norm_adj)
-            all_embeddings += [ego_embeddings]
-        
+        if self.t_feat_embedding is not None:
+            t_feat = self.t_feat_trs(self.t_feat_embedding.weight)
+            if self.modal_specific:
+                t_feat = self.modal_transform(t_feat, 'text')
+            t_feat = self.t_attn(t_feat, t_feat, t_feat)
+            t_feat = torch.cat((torch.zeros(self.n_users, self.feat_embed_dim).to(self.device), t_feat), dim=0)
+            modal_embeddings.append(t_feat)
+
+        # Early fusion with modal routing
+        if len(modal_embeddings) > 0:
+            if self.use_modal_routing:
+                fused_modal = self.modal_router(modal_embeddings)
+            else:
+                if self.modality_agg == "concat":
+                    fused_modal = torch.cat(modal_embeddings, dim=1)
+                else:
+                    fused_modal = self.modal_fusion(modal_embeddings)
+            
+            if self.fusion_layer == "early":
+                ego_embeddings = ego_embeddings + fused_modal
+            elif self.fusion_layer == "hybrid":
+                ego_embeddings = torch.cat([ego_embeddings, fused_modal], dim=1)
+
+        # Enhanced GNN with residual connections and layer normalization
+        all_embeddings = [ego_embeddings]
+        for i, gnn in enumerate(self.gnn_layers):
+            gnn_out = gnn(ego_embeddings, self.norm_adj)
+            if self.use_residual:
+                gnn_out = gnn_out + ego_embeddings
+            gnn_out = self.layer_norms[i](gnn_out)
+            all_embeddings.append(gnn_out)
+            ego_embeddings = gnn_out
+
+        # Late fusion
+        if len(modal_embeddings) > 0 and self.fusion_layer == "late":
+            all_embeddings.append(fused_modal)
+            
         all_embeddings = torch.stack(all_embeddings, dim=1)
         all_embeddings = torch.mean(all_embeddings, dim=1)
         
-        u_g_embeddings, i_g_embeddings = torch.split(
-            all_embeddings, [self.n_users, self.n_items], dim=0
-        )
+        u_g_embeddings, i_g_embeddings = torch.split(all_embeddings, [self.n_users, self.n_items], dim=0)
         return u_g_embeddings, i_g_embeddings
 
     def calculate_loss(self, interaction):
@@ -141,21 +171,35 @@ class MMREC(GeneralRecommender):
         neg_items = interaction[2]
 
         u_g_embeddings, i_g_embeddings = self.forward()
-
+        
         u_embeddings = u_g_embeddings[users]
         pos_embeddings = i_g_embeddings[pos_items]
         neg_embeddings = i_g_embeddings[neg_items]
 
-        pos_scores = torch.mul(u_embeddings, pos_embeddings).sum(dim=1)
-        neg_scores = torch.mul(u_embeddings, neg_embeddings).sum(dim=1)
-        mf_loss = -torch.log2(torch.sigmoid(pos_scores - neg_scores)).mean()
+        # BPR Loss
+        pos_scores = torch.sum(u_embeddings * pos_embeddings, dim=1)
+        neg_scores = torch.sum(u_embeddings * neg_embeddings, dim=1)
+        mf_loss = -torch.mean(torch.log2(torch.sigmoid(pos_scores - neg_scores)))
 
-        reg_loss = (
-            L2Loss(u_g_embeddings, self.reg_weight) + 
-            L2Loss(i_g_embeddings, self.reg_weight)
+        # Contrastive Loss for multimodal features
+        contrastive_loss = 0.0
+        if self.v_feat_embedding is not None and self.t_feat_embedding is not None:
+            v_feat = self.v_feat_trs(self.v_feat_embedding.weight[pos_items])
+            t_feat = self.t_feat_trs(self.t_feat_embedding.weight[pos_items])
+            
+            sim_matrix = torch.matmul(v_feat, t_feat.T) / self.temperature
+            labels = torch.arange(sim_matrix.size(0)).to(self.device)
+            contrastive_loss = F.cross_entropy(sim_matrix, labels) + F.cross_entropy(sim_matrix.T, labels)
+            contrastive_loss = contrastive_loss * 0.2
+
+        # L2 regularization
+        reg_loss = self.reg_weight * (
+            torch.norm(u_embeddings) +
+            torch.norm(pos_embeddings) +
+            torch.norm(neg_embeddings)
         )
 
-        return mf_loss + reg_loss
+        return mf_loss + reg_loss + contrastive_loss
 
     def full_sort_predict(self, interaction):
         user = interaction[0]
@@ -167,20 +211,58 @@ class MMREC(GeneralRecommender):
         return scores
 
 
+class MultiHeadAttention(nn.Module):
+    def __init__(self, dim_model, num_heads):
+        super().__init__()
+        self.dim_model = dim_model
+        self.num_heads = num_heads
+        self.head_dim = dim_model // num_heads
+        
+        self.q_linear = nn.Linear(dim_model, dim_model)
+        self.k_linear = nn.Linear(dim_model, dim_model)
+        self.v_linear = nn.Linear(dim_model, dim_model)
+        self.out = nn.Linear(dim_model, dim_model)
+        
+    def forward(self, q, k, v, mask=None):
+        batch_size = q.size(0)
+        
+        q = self.q_linear(q).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_linear(k).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_linear(v).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        scores = torch.matmul(q, k.transpose(-2, -1)) / torch.sqrt(torch.tensor(self.head_dim).float())
+        
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, -1e9)
+            
+        attn = F.softmax(scores, dim=-1)
+        context = torch.matmul(attn, v)
+        
+        context = context.transpose(1, 2).contiguous().view(batch_size, -1, self.dim_model)
+        output = self.out(context)
+        return output
+
+
 class MMGNNLayer(nn.Module):
     def __init__(self, embedding_dim, n_heads, dropout):
-        super(MMGNNLayer, self).__init__()
+        super().__init__()
         self.dropout = dropout
         self.n_heads = n_heads
-        self.attentions = [GATLayer(embedding_dim, embedding_dim//n_heads, dropout=dropout) for _ in range(n_heads)]
-        for i, attention in enumerate(self.attentions):
-            self.add_module('attention_{}'.format(i), attention)
-
+        self.attentions = nn.ModuleList([
+            GATLayer(embedding_dim, embedding_dim//n_heads, dropout=dropout)
+            for _ in range(n_heads)
+        ])
+        self.edge_weight_attention = EdgeWeightAttention(embedding_dim)
+        
     def forward(self, x, adj):
         x = F.dropout(x, self.dropout, training=self.training)
-        x = torch.cat([att(x, adj) for att in self.attentions], dim=1)
-        x = F.dropout(x, self.dropout, training=self.training)
-        return x
+        
+        # Apply edge weight attention
+        adj = self.edge_weight_attention(x, adj)
+        
+        # Multi-head attention
+        out = torch.cat([att(x, adj) for att in self.attentions], dim=1)
+        return out
 
 
 class GATLayer(nn.Module):
@@ -193,16 +275,18 @@ class GATLayer(nn.Module):
 
         self.W = nn.Parameter(torch.zeros(size=(in_dim, out_dim)))
         nn.init.xavier_uniform_(self.W.data, gain=1.414)
+        
         self.a_src = nn.Parameter(torch.zeros(size=(1, out_dim)))
         self.a_dst = nn.Parameter(torch.zeros(size=(1, out_dim)))
         nn.init.xavier_uniform_(self.a_src.data, gain=1.414)
         nn.init.xavier_uniform_(self.a_dst.data, gain=1.414)
+
         self.leakyrelu = nn.LeakyReLU(self.alpha)
 
     def forward(self, x, adj):
-        adj = adj.to_dense()
         h = torch.mm(x, self.W)
         N = h.size()[0]
+
         e_src = h @ self.a_src.t()
         e_dst = h @ self.a_dst.t()
         e = self.leakyrelu(e_src.expand(-1, N) + e_dst.expand(N, -1).t())
@@ -211,5 +295,89 @@ class GATLayer(nn.Module):
         attention = torch.where(adj > 0, e, zero_vec)
         attention = F.softmax(attention, dim=1)
         attention = F.dropout(attention, self.dropout, training=self.training)
+        
         h_prime = torch.matmul(attention, h)
-        return h_prime 
+        return h_prime
+
+
+class ModalFusion(nn.Module):
+    def __init__(self, dim):
+        super(ModalFusion, self).__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(dim, dim//2),
+            nn.ReLU(),
+            nn.Linear(dim//2, 1)
+        )
+        
+    def forward(self, modal_list):
+        if len(modal_list) == 1:
+            return modal_list[0]
+            
+        modal_stack = torch.stack(modal_list, dim=1)
+        weights = self.attention(modal_stack)
+        weights = F.softmax(weights, dim=1)
+        
+        fused = torch.sum(modal_stack * weights, dim=1)
+        return fused 
+
+
+class ModalSpecificTransform(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.visual_transform = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.ReLU(),
+            nn.Linear(dim, dim)
+        )
+        self.text_transform = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.ReLU(), 
+            nn.Linear(dim, dim)
+        )
+        
+    def forward(self, x, modality):
+        if modality == 'visual':
+            return self.visual_transform(x)
+        else:
+            return self.text_transform(x)
+
+
+class ModalRouter(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.routing_weights = Parameter(torch.randn(2, dim))
+        self.routing_bias = Parameter(torch.zeros(dim))
+        self.temperature = 0.1
+        
+    def forward(self, modal_list):
+        modal_stack = torch.stack(modal_list, dim=1)  # [N, num_modalities, dim]
+        
+        # Compute routing weights
+        routing_logits = torch.matmul(modal_stack, self.routing_weights.t())
+        routing_weights = F.softmax(routing_logits / self.temperature, dim=1)
+        
+        # Route and aggregate
+        routed_features = torch.sum(modal_stack * routing_weights.unsqueeze(-1), dim=1)
+        return routed_features + self.routing_bias
+
+
+class EdgeWeightAttention(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(dim * 2, dim),
+            nn.ReLU(),
+            nn.Linear(dim, 1)
+        )
+        
+    def forward(self, x, adj):
+        N = x.size(0)
+        row, col = adj._indices()
+        
+        # Compute attention scores
+        edge_features = torch.cat([x[row], x[col]], dim=1)
+        attention_weights = torch.sigmoid(self.attention(edge_features))
+        
+        # Update adjacency matrix
+        new_values = adj._values() * attention_weights.squeeze()
+        return torch.sparse.FloatTensor(adj._indices(), new_values, adj.size()) 
