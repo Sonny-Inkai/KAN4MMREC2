@@ -58,7 +58,9 @@ class EnhancedGATLayer(nn.Module):
     def __init__(self, dim, heads=4, dropout=0.2):
         super().__init__()
         self.gat = GATConv(dim, dim // heads, heads=heads, dropout=dropout, add_self_loops=True)
-        self.norm = nn.LayerNorm(dim)
+        self.efficient_attn = MemoryEfficientAttention(dim, num_heads=heads, dropout=dropout)
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
         self.dropout = nn.Dropout(dropout)
         self.ffn = nn.Sequential(
             nn.Linear(dim, dim * 4),
@@ -68,15 +70,23 @@ class EnhancedGATLayer(nn.Module):
         )
         
     def forward(self, x, edge_index, edge_weight=None):
-        # Multi-head attention
+        # Convert sparse inputs to dense if needed
+        if isinstance(x, torch.sparse.Tensor):
+            x = x.to_dense()
+        
+        # Graph attention
         h = self.gat(x, edge_index, edge_weight)
         h = self.dropout(h)
-        h = self.norm(h)
+        h = self.norm1(h)
+        
+        # Memory-efficient self attention
+        h = h + self.efficient_attn(h.unsqueeze(0)).squeeze(0)
+        h = self.norm1(h)
         
         # Feed-forward network
         h2 = self.ffn(h)
         h = h + h2  # Residual connection
-        h = self.norm(h)  # Final layer norm
+        h = self.norm2(h)  # Final layer norm
         return h
 
 class ModalFusionLayer(nn.Module):
@@ -113,6 +123,45 @@ class ModalFusionLayer(nn.Module):
         concat_features = torch.cat([img_emb, txt_emb], dim=1)
         fused = fused + self.fusion_layer(concat_features)
         return fused
+
+class MemoryEfficientAttention(nn.Module):
+    def __init__(self, dim, num_heads=4, dropout=0.2):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.out_proj = nn.Linear(dim, dim)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x, mask=None):
+        B, N, C = x.shape
+        q = self.q_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Chunked attention to save memory
+        chunk_size = 128
+        attn_chunks = []
+        for i in range(0, N, chunk_size):
+            end_idx = min(i + chunk_size, N)
+            Q = q[:, :, i:end_idx]
+            attn_weights = (Q @ k.transpose(-2, -1)) * self.scale
+            
+            if mask is not None:
+                attn_weights = attn_weights.masked_fill(mask == 0, float('-inf'))
+            
+            attn_weights = F.softmax(attn_weights, dim=-1)
+            attn_weights = self.dropout(attn_weights)
+            attn_chunk = attn_weights @ v
+            attn_chunks.append(attn_chunk)
+            
+        attn_output = torch.cat(attn_chunks, dim=2)
+        attn_output = attn_output.transpose(1, 2).reshape(B, N, C)
+        return self.out_proj(attn_output)
 
 class MMGAT(GeneralRecommender):
     def __init__(self, config, dataset):
@@ -172,10 +221,50 @@ class MMGAT(GeneralRecommender):
         self.mm_edge_index = None
         self.build_modal_graph()
         
+        # Enable gradient checkpointing for memory efficiency
+        for layer in self.mm_layers:
+            layer.gat.gradient_checkpointing = True
+        for layer in self.ui_layers:
+            layer.gat.gradient_checkpointing = True
+        
         self.to(self.device)
 
+    def get_norm_adj_mat(self):
+        """Get normalized adjacency matrix in a way that's compatible with CUDA sparse operations"""
+        # Create adjacency matrix
+        A = sp.dok_matrix((self.n_users + self.n_items, self.n_users + self.n_items), dtype=np.float32)
+        inter_M = self.interaction_matrix
+        inter_M_t = self.interaction_matrix.transpose()
+        data_dict = dict(zip(zip(inter_M.row, inter_M.col + self.n_users), [1] * inter_M.nnz))
+        data_dict.update(dict(zip(zip(inter_M_t.row + self.n_users, inter_M_t.col), [1] * inter_M_t.nnz)))
+        A._update(data_dict)
+
+        # Normalize adjacency matrix
+        sumArr = (A > 0).sum(axis=1)
+        diag = np.array(sumArr.flatten())[0] + 1e-7
+        diag = np.power(diag, -0.5)
+        D = sp.diags(diag)
+        L = D * A * D
+        
+        # Convert to COO format
+        L = sp.coo_matrix(L)
+        row = L.row
+        col = L.col
+        
+        # Convert to torch tensor
+        indices = torch.LongTensor([row, col])
+        values = torch.FloatTensor(L.data)
+        
+        # Use sparse_coo_tensor instead of SparseTensor
+        return torch.sparse_coo_tensor(
+            indices, 
+            values,
+            torch.Size((self.n_nodes, self.n_nodes)),
+            device=self.device
+        )
+
     def build_edges(self):
-        # Enhanced edge building with normalized adjacency matrix
+        """Build edge indices and weights in a CUDA-compatible way"""
         rows = self.interaction_matrix.row
         cols = self.interaction_matrix.col + self.n_users
         
@@ -188,7 +277,7 @@ class MMGAT(GeneralRecommender):
         edge_index, _ = remove_self_loops(edge_index)
         edge_index, _ = add_self_loops(edge_index, num_nodes=self.n_users + self.n_items)
         
-        # Calculate edge weights (degrees)
+        # Calculate edge weights using dense operations
         row, col = edge_index
         deg = degree(row, self.n_users + self.n_items, dtype=torch.float)
         deg_inv_sqrt = deg.pow(-0.5)
@@ -198,21 +287,22 @@ class MMGAT(GeneralRecommender):
         return edge_index, edge_weight
 
     def build_modal_graph(self):
+        """Build modal graph with dense operations"""
         if self.v_feat is None and self.t_feat is None:
             return
             
-        # Build modal graph with enhanced similarity computation
+        # Build modal graph with dense similarity computation
         if self.v_feat is not None:
-            v_feats = F.normalize(self.v_feat, p=2, dim=1)
+            v_feats = F.normalize(self.v_feat.to_dense() if self.v_feat.is_sparse else self.v_feat, p=2, dim=1)
             v_sim = torch.mm(v_feats, v_feats.t())
             v_values, v_indices = v_sim.topk(k=self.knn_k, dim=1)
-            del v_sim  # Free memory
+            del v_sim
             
         if self.t_feat is not None:
-            t_feats = F.normalize(self.t_feat, p=2, dim=1)
+            t_feats = F.normalize(self.t_feat.to_dense() if self.t_feat.is_sparse else self.t_feat, p=2, dim=1)
             t_sim = torch.mm(t_feats, t_feats.t())
             t_values, t_indices = t_sim.topk(k=self.knn_k, dim=1)
-            del t_sim  # Free memory
+            del t_sim
         
         # Combine modalities with adaptive weighting
         if self.v_feat is not None and self.t_feat is not None:
@@ -337,8 +427,14 @@ class MMGAT(GeneralRecommender):
         
         # Adaptive loss weighting
         modal_weight = self.lambda_coeff * torch.sigmoid(modal_loss.detach())
-        total_loss = mf_loss + modal_weight * modal_loss + reg_loss
         
+        # Apply warm-up scaling to losses during early training
+        if hasattr(self, 'epoch') and self.epoch < 5:
+            warmup_factor = min(1.0, self.epoch / 5)
+            modal_weight = modal_weight * warmup_factor
+            reg_loss = reg_loss * warmup_factor
+        
+        total_loss = mf_loss + modal_weight * modal_loss + reg_loss
         return total_loss
 
     def full_sort_predict(self, interaction):
