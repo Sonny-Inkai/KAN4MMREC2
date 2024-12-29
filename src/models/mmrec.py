@@ -19,7 +19,7 @@ from utils.utils import build_sim, compute_normalized_laplacian
 
 class MMREC(GeneralRecommender):
     def __init__(self, config, dataset):
-        super(MMRec, self).__init__(config, dataset)
+        super(MMREC, self).__init__(config, dataset)
 
         self.embedding_dim = config["embedding_size"]
         self.feat_embed_dim = config["feat_embed_dim"]
