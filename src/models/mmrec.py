@@ -200,6 +200,7 @@ class GATLayer(nn.Module):
         self.leakyrelu = nn.LeakyReLU(self.alpha)
 
     def forward(self, x, adj):
+        adj = adj.to_dense()
         h = torch.mm(x, self.W)
         N = h.size()[0]
         e_src = h @ self.a_src.t()
